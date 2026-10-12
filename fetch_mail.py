@@ -9,6 +9,7 @@
     python fetch_mail.py --max 50        每个账号最多处理 50 封（默认 200）
     python fetch_mail.py --reset         忽略上次记录，重新按 --days 拉取
 
+只拉收件箱"主要"（Primary）标签页的邮件，社交、推广、更新、论坛都不拉。
 这个程序只读邮件，不会修改、移动、删除或标记任何邮件。
 """
 
@@ -32,6 +33,7 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 OVERLAP_SECONDS = 3600     # 增量拉取时往前多倒退 1 小时，宁可多拉再去重，避免漏邮件
 MAX_BODY_CHARS = 4000      # 正文最多保留的字数
 SEEN_IDS_KEEP = 3000       # 每个账号记住最近多少个已拉取的邮件 ID，用于去重
+
 
 
 # ---------------------------------------------------------------- 文件读写
@@ -206,12 +208,12 @@ def fetch_one(service, alias, msg_id):
 # ---------------------------------------------------------------- 主流程
 
 def build_query(acc_state, days, reset):
-    """有上次记录就只拉之后的；否则拉最近 days 天。"""
+    """有上次记录就只拉之后的；否则拉最近 days 天。只拉"主要"标签页。"""
     last_ms = acc_state.get("last_internal_ms")
     if last_ms and not reset:
         # 用秒数时间戳，避免 Gmail 把日期按太平洋时间零点解释
-        return f"after:{last_ms // 1000 - OVERLAP_SECONDS}"
-    return f"newer_than:{days}d"
+        return f"after:{last_ms // 1000 - OVERLAP_SECONDS} category:primary"
+    return f"newer_than:{days}d category:primary"
 
 
 def fetch_account(service, account, acc_state, args):
@@ -249,14 +251,20 @@ def main():
     ap.add_argument("--max", type=int, default=200, help="每个账号单次最多处理几封（默认 200）")
     ap.add_argument("--account", help="只处理这个别名的账号")
     ap.add_argument("--reset", action="store_true", help="忽略上次记录，重新按 --days 拉取")
-    args = ap.parse_args()
+    try:
+        fetch_all(ap.parse_args())
+    except ValueError as e:
+        sys.exit(str(e))
 
+
+def fetch_all(args):
+    """拉取所有（或指定）账号的新邮件并保存。返回 (邮件列表, 保存路径)，没有新邮件时路径为 None。"""
     accounts = [a for a in load_json(ACCOUNTS_FILE, {"accounts": []})["accounts"]
                 if a.get("enabled", True)]
     if args.account:
         accounts = [a for a in accounts if a["alias"] == args.account]
     if not accounts:
-        sys.exit("没有要处理的账号，请检查 accounts.json 或 --account 参数。")
+        raise ValueError("没有要处理的账号，请检查 accounts.json 或 --account 参数。")
 
     state = load_json(STATE_FILE, {})
     all_mail = []
@@ -270,7 +278,7 @@ def main():
     save_private(STATE_FILE, state)
     if not all_mail:
         print("\n完成：没有新邮件。")
-        return
+        return all_mail, None
 
     all_mail.sort(key=lambda r: r["internal_ms"], reverse=True)   # 所有账号合并，从新到旧
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -281,6 +289,7 @@ def main():
     save_private(out_path, {"fetched_at": datetime.now().isoformat(timespec="seconds"),
                             "count": len(all_mail), "messages": all_mail})
     print(f"\n完成：共 {len(all_mail)} 封新邮件，已保存到 {out_path}")
+    return all_mail, out_path
 
 
 if __name__ == "__main__":

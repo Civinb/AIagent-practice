@@ -223,3 +223,5 @@ __marimo__/
 credentials.json
 tokens/
 accounts.json
+data/
+state/

@@ -7,6 +7,7 @@ Gemini agent
     python agent.py
 """
 
+import argparse
 import ast
 import json
 import operator
@@ -15,10 +16,12 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from google import genai
 
-MODEL = "gemini-3.5-flash-lite"   # 官方文档示例用的模型；想省额度可换 gemini-3.5-flash-lite
-MAX_STEPS = 8                # 防止模型无限调用工具
+import fetch_mail
 
-client = genai.Client()      # 会从环境变量 GEMINI_API_KEY 读取 key
+MODEL = "gemini-3.5-flash-lite"   # 官方文档示例用的模型；想省额度可换 gemini-3.5-flash-lite
+MAX_STEPS = 12                   # 防止模型无限调用工具
+
+client = genai.Client()           # 会从环境变量 GEMINI_API_KEY 读取 key
 
 
 # ---------------------------------------------------------------------------
@@ -55,49 +58,127 @@ def calculate(expression: str) -> dict:
     return {"expression": expression, "result": value}
 
 
-def list_rename_files(path:str) -> dict:
-    # 找出目录下带有.弹幕后缀的弹幕文件，返回文件路径
-    files = []
-    p = Path(path)
-    files = [str(p) for p in p.rglob("*.xml") if ".弹幕" in p.name and p.is_file()]
-    return {"files": files}
-
-
 def get_current_dir() -> dict:
     """返回当前工作目录"""
     return {"current_dir": str(Path.cwd())}
 
 
-def create_rename_mapping(files: list[str]) -> dict:
-    """为每个文件生成新的重命名路径"""
-    mapping = []
-    for file in files:
-        old_path = Path(file)
-        new_name = old_path.stem.replace(".弹幕", "") + old_path.suffix
-        new_path = old_path.with_name(new_name)
-        mapping.append({"old_path": str(old_path), "new_path": str(new_path)})
-    return {"rename_mapping": mapping}
+def get_accounts() -> dict:
+    """返回已配置的邮箱账号列表"""
+    accounts = []
+    with open("accounts.json", encoding="utf-8") as f:
+        for a in json.load(f).get("accounts", []):
+            if a.get("enabled", True):
+                accounts.append({"alias": a["alias"], "email": a["email"], "description": a.get("description", "")})
+    return {"accounts": accounts}
 
 
-def rename_files(mapping: list[dict]) -> dict:
-    """重命名文件"""
-    for item in mapping:
-        old_path = Path(item["old_path"])
-        new_path = Path(item["new_path"])
-        if not old_path.exists():
-            raise FileNotFoundError(f"文件不存在: {item['old_path']}")
-        old_path.rename(new_path)
-    return {"status": "success."}
+CLASSIFY_FILE = Path("state") / "classified.json"
+PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
-def create_rename_logfile(mapping: list[dict]):
-    """生成重命名日志"""
-    log = []
-    for item in mapping:
-        log.append(f"Renamed: {item['old_path']} -> {item['new_path']}")
-    log_path = Path("rename_log.txt")
-    log_path.write_text("\n".join(log), encoding="utf-8")
-    return {"logfile": str(log_path)}
+def _load_all_mail() -> dict:
+    """读 data/ 下所有拉取结果，按 "别名:邮件ID" 建索引"""
+    mails = {}
+    for p in sorted(Path(fetch_mail.DATA_DIR).glob("*.json")):
+        for m in fetch_mail.load_json(p, {}).get("messages", []):
+            mails[m["key"]] = m
+    return mails
+
+
+def fetch_new_mail(account: str | None = None) -> dict:
+    """拉取新邮件，只返回数量统计"""
+    args = argparse.Namespace(days=2, max=200, account=account, reset=False)
+    mails, out_path = fetch_mail.fetch_all(args)
+    by_account = {}
+    for m in mails:
+        by_account[m["account"]] = by_account.get(m["account"], 0) + 1
+    return {"total": len(mails), "by_account": by_account, "saved_to": out_path}
+
+
+def classify_one(mail: dict) -> dict:
+    """用 AI 给一封邮件定优先级"""
+    prompt = (
+        "你是邮件助理。判断这封邮件需要我处理的优先级，只输出 JSON："
+        '{"priority": "high|medium|low", "summary": "一句话说明要做什么或这是什么"}\n'
+        "high=需要尽快回复或处理；medium=需要处理但不急；low=通知、广告、无需处理。\n\n"
+        f"发件人：{mail['from']}\n主题：{mail['subject']}\n正文：\n{mail['body'][:2000]}"
+    )
+    resp = client.models.generate_content(
+        model=MODEL, contents=prompt, config={"response_mime_type": "application/json"})
+    result = json.loads(resp.text)
+    if result.get("priority") not in PRIORITY_ORDER:
+        result["priority"] = "medium"
+    return result
+
+
+def classify_pending(limit: int = 30) -> dict:
+    """对还没分类的邮件跑 AI 分类，返回各优先级数量"""
+    classified = fetch_mail.load_json(CLASSIFY_FILE, {})
+    all_mail = _load_all_mail()
+    pending = [m for k, m in all_mail.items() if k not in classified][:limit]
+    counts, errors = {p: 0 for p in PRIORITY_ORDER}, 0
+    for m in pending:
+        try:
+            r = classify_one(m)
+        except Exception as e:
+            print(f"  [分类失败] {m['key']}：{e}")
+            errors += 1
+            continue
+        classified[m["key"]] = {
+            "priority": r["priority"], "summary": r.get("summary", ""),
+            "account": m["account"], "subject": m["subject"], "from": m["from"],
+            "received_at": m["received_at"],
+        }
+        counts[r["priority"]] += 1
+    fetch_mail.save_private(str(CLASSIFY_FILE), classified)
+    return {"classified": sum(counts.values()), "by_priority": counts, "errors": errors,
+            "remaining": len(all_mail) - len(classified)}
+
+
+_last_listing: dict[int, str] = {}   # 最近一次 list_todos 的 序号 -> 邮件 key
+
+
+def list_todos(account: str | None = None, priority: str | None = None,
+               since: str | None = None) -> dict:
+    """按优先级返回待办（带序号），可按账号、优先级、日期（YYYY-MM-DD 起）筛选"""
+    todos = []
+    for key, c in fetch_mail.load_json(CLASSIFY_FILE, {}).items():
+        if c.get("done"):
+            continue
+        if account and c["account"] != account:
+            continue
+        if priority and c["priority"] != priority:
+            continue
+        if since and c["received_at"] < since:
+            continue
+        todos.append({"key": key, **c})
+    todos.sort(key=lambda t: t["received_at"], reverse=True)
+    todos.sort(key=lambda t: PRIORITY_ORDER[t["priority"]])
+    _last_listing.clear()
+    for no, t in enumerate(todos, 1):
+        t["no"] = no
+        _last_listing[no] = t["key"]
+    return {"count": len(todos), "todos": todos}
+
+
+def keep_todos(keep: list[int]) -> dict:
+    """在最近一次 list_todos 的结果里，只保留 keep 中的序号，其余标记为已删除"""
+    if not _last_listing:
+        return {"error": "还没有列出过待办，请先调用 list_todos"}
+    unknown = [n for n in keep if n not in _last_listing]
+    if unknown:
+        return {"error": f"这些序号不存在：{unknown}"}
+    # 不从 classified.json 里删掉条目，否则 classify_pending 会把它们重新分类
+    classified = fetch_mail.load_json(CLASSIFY_FILE, {})
+    removed = 0
+    for no, key in _last_listing.items():
+        if no not in keep and key in classified:
+            classified[key]["done"] = True
+            removed += 1
+    fetch_mail.save_private(str(CLASSIFY_FILE), classified)
+    _last_listing.clear()                      # 序号已失效，下次需重新列出
+    return {"kept": sorted(keep), "removed": removed}
 
 
 def confirm(call) -> bool:
@@ -110,15 +191,16 @@ def confirm(call) -> bool:
 TOOL_IMPLS = {
     "get_current_time": get_current_time,
     "calculate": calculate,
-    "list_rename_files": list_rename_files,
     "get_current_dir": get_current_dir,
-    "create_rename_mapping": create_rename_mapping,
-    "rename_files": rename_files,
-    "create_rename_logfile": create_rename_logfile,
+    "get_accounts": get_accounts,
+    "fetch_new_mail": fetch_new_mail,
+    "classify_pending": classify_pending,
+    "list_todos": list_todos,
+    "keep_todos": keep_todos,
 }
 
 DANGEROUS_TOOLS = {
-    "rename_files",
+    "keep_todos",
 }
 # ---------------------------------------------------------------------------
 # 2. 工具说明书
@@ -154,18 +236,6 @@ TOOLS = [
     },
     {
         "type": "function",
-        "name": "list_rename_files",
-        "description": "List all files with .弹幕 suffix in a given directory.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "The directory path to list files in."},
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "type": "function",
         "name": "get_current_dir",
         "description": "Return the current working directory.",
         "parameters": {
@@ -174,67 +244,61 @@ TOOLS = [
         },
     },
     {
-        
         "type": "function",
-        "name": "create_rename_mapping",
-        "description": "Generate new file names for a list of files to be renamed.",
+        "name": "get_accounts",
+        "description": "List configured mail accounts (alias, email, description).",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "fetch_new_mail",
+        "description": "Fetch new inbox mail from all accounts (or one alias). Returns counts only.",
         "parameters": {
             "type": "object",
             "properties": {
-                "files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of file paths to be renamed.",
-                },
+                "account": {"type": "string", "description": "Optional account alias; omit for all accounts"},
             },
-            "required": ["files"],
         },
     },
     {
         "type": "function",
-        "name": "rename_files",
-        "description": "Rename files according to a provided mapping.",
+        "name": "classify_pending",
+        "description": "Run AI priority classification on fetched mail not yet classified. Returns counts per priority.",
         "parameters": {
             "type": "object",
             "properties": {
-                "mapping": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "old_path": {"type": "string"},
-                            "new_path": {"type": "string"},
-                        },
-                        "required": ["old_path", "new_path"],
-                    },
-                    "description": "List of old and new file paths for renaming.",
-                },
+                "limit": {"type": "integer", "description": "Max mails to classify this call, default 30"},
             },
-            "required": ["mapping"],
         },
     },
     {
         "type": "function",
-        "name": "create_rename_logfile",
-        "description": "Create a log file documenting the renaming of files.",
+        "name": "list_todos",
+        "description": "List classified mail sorted by priority (high first). Each todo has a number 'no'; "
+                       "always show it to the user. All filters optional.",
         "parameters": {
             "type": "object",
             "properties": {
-                "mapping": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "old_path": {"type": "string"},
-                            "new_path": {"type": "string"},
-                        },
-                        "required": ["old_path", "new_path"],
-                    },
-                },
+                "account": {"type": "string", "description": "Account alias"},
+                "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+                "since": {"type": "string", "description": "Only mail received on/after this date, YYYY-MM-DD"},
             },
-            "required": ["mapping"],
         },
-    }
+    },
+    {
+        "type": "function",
+        "name": "keep_todos",
+        "description": "Keep only the given numbers ('no') from the most recent list_todos result; "
+                       "all other todos in that list are removed. Use when the user picks which todos to keep.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keep": {"type": "array", "items": {"type": "integer"},
+                         "description": "Todo numbers to keep, e.g. [1, 3, 5]; empty list removes all"},
+            },
+            "required": ["keep"],
+        },
+    },
 ]
 
 
@@ -289,7 +353,8 @@ def main():
     print("输入问题，回车发送；输入 exit 退出。")
     previous_id = None 
     SHORTCUTS = {
-                "重命名": "把这个目录下的所有 .弹幕 文件重命名为去掉 .弹幕 后缀的文件名，并生成一个重命名日志文件。",
+                "新邮件":"拉取上次拉取后新收到的邮件，返回的报告按照账号和重要性分类，报告中只包含新拉取的邮件（验证码邮件视为不重要）",
+                "待办":"根据已拉取的邮件列出所有待办任务，按优先级排序，每条前面标上序号 no",
             }
     while True:
         user_text = input("你> ").strip()
