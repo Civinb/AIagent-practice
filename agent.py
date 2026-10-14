@@ -15,6 +15,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from google import genai
+import sqlite3
 
 import fetch_mail
 

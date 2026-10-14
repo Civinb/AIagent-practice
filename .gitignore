@@ -225,3 +225,4 @@ tokens/
 accounts.json
 data/
 state/
+mail.db
