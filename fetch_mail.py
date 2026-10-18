@@ -1,13 +1,13 @@
-"""拉取邮件示例程序：从 accounts.json 里的每个账号拉取收件箱的新邮件，清洗后存到 data/ 文件夹。
+"""拉取邮件：从 accounts.json 里每个启用的账号拉取收件箱的新邮件，清洗后存进数据库 mail.db。
 
 前提：已经用 authorize.py 为每个账号授权（tokens/别名.json 存在）。
 
 用法（在项目文件夹里运行）：
-    python fetch_mail.py                 首次运行拉最近 2 天；之后只拉"上次之后"的新邮件
-    python fetch_mail.py --days 1        首次运行时拉最近 1 天
-    python fetch_mail.py --account work  只拉别名为 work 的账号
-    python fetch_mail.py --max 50        每个账号最多处理 50 封（默认 200）
-    python fetch_mail.py --reset         忽略上次记录，重新按 --days 拉取
+    python fetch_mail.py               库里没有该账号的邮件时拉最近 2 天；之后只拉"库里最新一封之后"的
+    python fetch_mail.py --days 1      库里没有该账号的邮件时拉最近 1 天
+    python fetch_mail.py --max 50      每个账号最多处理 50 封（默认 200）
+
+其他程序（如网页界面）调用 fetch_all()，它返回汇总字典，不打印任何东西。
 
 只拉收件箱"主要"（Primary）标签页的邮件，社交、推广、更新、论坛都不拉。
 这个程序只读邮件，不会修改、移动、删除或标记任何邮件。
@@ -20,23 +20,21 @@ import email.policy
 import json
 import os
 import re
-import sys
 from datetime import datetime
 from html.parser import HTMLParser
 
+import db
+
 ACCOUNTS_FILE = "accounts.json"
 TOKENS_DIR = "tokens"
-DATA_DIR = "data"
-STATE_FILE = os.path.join("state", "fetch_state.json")
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 OVERLAP_SECONDS = 3600     # 增量拉取时往前多倒退 1 小时，宁可多拉再去重，避免漏邮件
 MAX_BODY_CHARS = 4000      # 正文最多保留的字数
-SEEN_IDS_KEEP = 3000       # 每个账号记住最近多少个已拉取的邮件 ID，用于去重
+MAX_ERROR_CHARS = 200      # 错误信息最多保留的字数（只放进汇总，不含令牌和正文）
 
 
-
-# ---------------------------------------------------------------- 文件读写
+# ---------------------------------------------------------------- 文件读取
 
 def load_json(path, default):
     if not os.path.exists(path):
@@ -45,18 +43,19 @@ def load_json(path, default):
         return json.load(f)
 
 
-def save_private(path, data):
-    """写 JSON 文件；在 Mac/Linux 上设成只有自己能读写（邮件内容属于隐私）。"""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def load_accounts():
+    """读取 accounts.json，返回启用的账号列表（没写 enabled 的视为启用）。"""
+    data = load_json(ACCOUNTS_FILE, {"accounts": []})
+    return [a for a in data.get("accounts", []) if a.get("enabled", True)]
 
 
 # ---------------------------------------------------------------- 连接 Gmail
 
 def connect(account):
-    """读取该账号的令牌，连接 Gmail，并核对邮箱。失败时返回 None。"""
+    """读取该账号的令牌，连接 Gmail，并核对邮箱。
+
+    返回 (service, None)；失败时返回 (None, 错误信息)。
+    """
     from google.auth.exceptions import RefreshError
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -64,8 +63,7 @@ def connect(account):
     alias, expected = account["alias"], account["email"]
     path = os.path.join(TOKENS_DIR, f"{alias}.json")
     if not os.path.exists(path):
-        print(f"[跳过] {alias}：没有令牌，请先运行 python authorize.py {alias}")
-        return None
+        return None, f"{alias}：没有令牌，请先运行 python authorize.py {alias}"
 
     creds = Credentials.from_authorized_user_file(path, SCOPES)
     service = build("gmail", "v1", credentials=creds)
@@ -73,14 +71,12 @@ def connect(account):
         # 访问令牌过期时，库会用刷新令牌自动换新
         actual = service.users().getProfile(userId="me").execute()["emailAddress"]
     except RefreshError:
-        print(f"[跳过] {alias}：授权已失效（测试状态下约 7 天过期），"
-              f"请运行 python authorize.py {alias} 重新授权")
-        return None
+        return None, (f"{alias}：授权已失效（测试状态下约 7 天过期），"
+                      f"请运行 python authorize.py {alias} 重新授权")
 
     if actual.lower() != expected.lower():
-        print(f"[跳过] {alias}：令牌属于 {actual}，与清单里的 {expected} 不一致，请重新授权")
-        return None
-    return service
+        return None, f"{alias}：令牌属于 {actual}，与清单里的 {expected} 不一致，请重新授权"
+    return service, None
 
 
 # ---------------------------------------------------------------- 第一步：拿 ID 清单
@@ -207,89 +203,123 @@ def fetch_one(service, alias, msg_id):
 
 # ---------------------------------------------------------------- 主流程
 
-def build_query(acc_state, days, reset):
-    """有上次记录就只拉之后的；否则拉最近 days 天。只拉"主要"标签页。"""
-    last_ms = acc_state.get("last_internal_ms")
-    if last_ms and not reset:
+def build_query(alias, days):
+    """库里有该账号的邮件就只拉最新一封之后的；否则拉最近 days 天。只拉"主要"标签页。"""
+    last_ms = db.latest_internal_ms(alias)
+    if last_ms:
         # 用秒数时间戳，避免 Gmail 把日期按太平洋时间零点解释
         return f"after:{last_ms // 1000 - OVERLAP_SECONDS} category:primary"
     return f"newer_than:{days}d category:primary"
 
 
-def fetch_account(service, account, acc_state, args):
+def list_new_ids(service, alias, days, limit):
+    """列出该账号符合条件的邮件 ID，跳过库里已有的。
+
+    返回 (找到的总数, 新邮件 ID 列表)。新邮件按从旧到新排列：
+    这样中途中断时，库里"最新一封"不会跑到还没读的邮件前面，下次增量拉取不会漏掉它们。
+    """
+    ids = list_message_ids(service, build_query(alias, days), limit)
+    new_ids = [i for i in ids if not db.email_exists(f"{alias}:{i}")]
+    new_ids.reverse()
+    return len(ids), new_ids
+
+
+def save_one(service, alias, msg_id):
+    """读取一封邮件并立即存库。返回是否真的新增了一条。"""
+    return db.insert_email(fetch_one(service, alias, msg_id))
+
+
+def describe_error(alias, err):
+    """把异常转成一行简短的错误信息（只含异常类型和简短说明）。"""
+    return f"{alias}：出错（{type(err).__name__}）：{str(err)[:MAX_ERROR_CHARS]}"
+
+
+def prepare_account(account, days, max_per_account):
+    """连接一个账号并列出新邮件 ID。
+
+    返回 (service, 找到的总数, 新邮件 ID 列表, 问题列表)；连接失败时 service 为 None。
+    """
     alias = account["alias"]
-    query = build_query(acc_state, args.days, args.reset)
-    seen = set() if args.reset else set(acc_state.get("seen_ids", []))
+    try:
+        service, error = connect(account)
+        if service is None:
+            return None, 0, [], [error]
+        found, new_ids = list_new_ids(service, alias, days, max_per_account)
+    except Exception as e:                       # 网络、令牌文件损坏等，记下来继续处理其他账号
+        return None, 0, [], [describe_error(alias, e)]
 
-    ids = list_message_ids(service, query, args.max)
-    new_ids = [i for i in ids if i not in seen]
-    print(f"[{alias}] 条件 {query}：找到 {len(ids)} 封，其中新邮件 {len(new_ids)} 封")
-    if len(ids) >= args.max:
-        print(f"[{alias}] 提醒：已达到单次上限 {args.max} 封，可能还有更早的邮件没拉")
+    problems = []
+    if found >= max_per_account:
+        problems.append(f"{alias}：已达到单次上限 {max_per_account} 封，可能还有更早的邮件没拉")
+    return service, found, new_ids, problems
 
-    from googleapiclient.errors import HttpError
-    results = []
-    for n, msg_id in enumerate(new_ids, 1):
-        try:
-            results.append(fetch_one(service, alias, msg_id))
-        except HttpError as e:
-            print(f"[{alias}] 读取第 {n} 封（{msg_id}）失败，已跳过：{e}")
-    print(f"[{alias}] 成功读取 {len(results)} 封")
 
-    # 更新状态：记住拉过的 ID（按先后顺序，只保留最近的）和最新一封的接收时间
-    old_seen = [] if args.reset else acc_state.get("seen_ids", [])
-    acc_state["seen_ids"] = (old_seen + [r["id"] for r in results])[-SEEN_IDS_KEEP:]
-    if results:
-        newest = max(r["internal_ms"] for r in results)
-        acc_state["last_internal_ms"] = max(newest, acc_state.get("last_internal_ms") or 0)
-    return results
+def fetch_all(days=2, max_per_account=200, progress=None):
+    """拉取所有启用账号的新邮件并存库，返回汇总：
+
+        {"accounts": {别名: {"found": 找到, "new": 新增入库, "failed": 读取失败}},
+         "problems": ["work：授权已失效，……", ...]}
+
+    "accounts" 只包含成功连接并列出邮件的账号；连接失败的账号只出现在 "problems" 里。
+    progress 是可选回调 progress(fraction, message)，每处理完一封调用一次，
+    fraction 在 0–1 之间，覆盖所有账号。不抛异常中断，问题都记在 "problems" 里。
+    """
+    db.init_db()
+    summary = {"accounts": {}, "problems": []}
+    try:
+        accounts = load_accounts()
+    except (OSError, ValueError) as e:           # 文件读不了或 JSON 格式错误
+        summary["problems"].append(f"读取 {ACCOUNTS_FILE} 失败（{type(e).__name__}）：{e}")
+        return summary
+    if not accounts:
+        summary["problems"].append(f"{ACCOUNTS_FILE} 里没有启用的账号")
+        return summary
+
+    # 先列出所有账号的新邮件 ID，算出总数，才能计算进度
+    jobs = []
+    for account in accounts:
+        service, found, new_ids, problems = prepare_account(account, days, max_per_account)
+        summary["problems"].extend(problems)
+        if service is not None:
+            summary["accounts"][account["alias"]] = {"found": found, "new": 0, "failed": 0}
+            jobs.append((account["alias"], service, new_ids))
+
+    # 再逐封读取，每读到一封就立刻存库
+    total = sum(len(new_ids) for _, _, new_ids in jobs)
+    done = 0
+    for alias, service, new_ids in jobs:
+        stats = summary["accounts"][alias]
+        for msg_id in new_ids:
+            try:
+                if save_one(service, alias, msg_id):
+                    stats["new"] += 1
+            except Exception:                    # 单封失败不影响其他邮件
+                stats["failed"] += 1
+            done += 1
+            if progress is not None:
+                progress(done / total, f"{alias}：已处理 {done}/{total} 封")
+    return summary
+
+
+# ---------------------------------------------------------------- 命令行入口
+
+def format_summary(summary):
+    """把汇总字典排成几行文字，供命令行打印。"""
+    lines = [f"[{alias}] 找到 {s['found']} 封，新增 {s['new']} 封，失败 {s['failed']} 封"
+             for alias, s in summary["accounts"].items()]
+    if summary["problems"]:
+        lines.append("问题：")
+        lines.extend(f"  - {p}" for p in summary["problems"])
+    return "\n".join(lines) if lines else "没有处理任何账号。"
 
 
 def main():
-    ap = argparse.ArgumentParser(description="从多个 Gmail 账号拉取收件箱新邮件")
-    ap.add_argument("--days", type=int, default=2, help="首次运行拉最近几天（默认 2）")
+    ap = argparse.ArgumentParser(description="从多个 Gmail 账号拉取收件箱新邮件，存进 mail.db")
+    ap.add_argument("--days", type=int, default=2,
+                    help="库里没有该账号的邮件时，拉最近几天（默认 2）")
     ap.add_argument("--max", type=int, default=200, help="每个账号单次最多处理几封（默认 200）")
-    ap.add_argument("--account", help="只处理这个别名的账号")
-    ap.add_argument("--reset", action="store_true", help="忽略上次记录，重新按 --days 拉取")
-    try:
-        fetch_all(ap.parse_args())
-    except ValueError as e:
-        sys.exit(str(e))
-
-
-def fetch_all(args):
-    """拉取所有（或指定）账号的新邮件并保存。返回 (邮件列表, 保存路径)，没有新邮件时路径为 None。"""
-    accounts = [a for a in load_json(ACCOUNTS_FILE, {"accounts": []})["accounts"]
-                if a.get("enabled", True)]
-    if args.account:
-        accounts = [a for a in accounts if a["alias"] == args.account]
-    if not accounts:
-        raise ValueError("没有要处理的账号，请检查 accounts.json 或 --account 参数。")
-
-    state = load_json(STATE_FILE, {})
-    all_mail = []
-    for account in accounts:
-        service = connect(account)
-        if service is None:
-            continue
-        acc_state = state.setdefault(account["alias"], {})
-        all_mail.extend(fetch_account(service, account, acc_state, args))
-
-    save_private(STATE_FILE, state)
-    if not all_mail:
-        print("\n完成：没有新邮件。")
-        return all_mail, None
-
-    all_mail.sort(key=lambda r: r["internal_ms"], reverse=True)   # 所有账号合并，从新到旧
-    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    out_path, n = os.path.join(DATA_DIR, f"{stamp}.json"), 1
-    while os.path.exists(out_path):                                # 避免覆盖已有文件
-        n += 1
-        out_path = os.path.join(DATA_DIR, f"{stamp}_{n}.json")
-    save_private(out_path, {"fetched_at": datetime.now().isoformat(timespec="seconds"),
-                            "count": len(all_mail), "messages": all_mail})
-    print(f"\n完成：共 {len(all_mail)} 封新邮件，已保存到 {out_path}")
-    return all_mail, out_path
+    args = ap.parse_args()
+    print(format_summary(fetch_all(days=args.days, max_per_account=args.max)))
 
 
 if __name__ == "__main__":
