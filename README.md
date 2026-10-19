@@ -23,7 +23,6 @@
 | `requirements.txt` | 依赖清单（固定版本） |
 | `mail.db` | SQLite 数据库：邮件、分析结果、待办（运行后自动生成） |
 | `eval.csv` | `analyze.py --export` 导出的评估表（可选） |
-| `agent.py` | 早期练习用的 Gemini agent 脚本，本工具运行时不使用 |
 
 ## 首次使用
 
@@ -93,4 +92,8 @@ accounts.json
 tokens/
 mail.db
 eval.csv
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 ```

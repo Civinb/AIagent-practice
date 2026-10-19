@@ -126,21 +126,32 @@ def run_tests():
     restored = db.get_todo(todo_a["id"])
     assert restored["done"] == 0 and restored["done_at"] is None
 
+    # 删除待办：待办消失，对应邮件进入已丢弃
     assert db.delete_todos([todo_c["id"]]) == 1
     assert db.get_todo(todo_c["id"]) is None
+    assert db.get_email(c["key"])["status"] == db.DISCARDED
+    assert db.delete_todos([todo_c["id"]]) == 0                # 已删除的不再计数
 
-    # 6. 丢弃再恢复
+    # 恢复到待审后可以再次加入待办，会新建一条；再删除又回到已丢弃
+    assert db.set_status([c["key"]], db.REVIEW) == 1
+    assert db.add_todos([c["key"]]) == 1
+    todo_c2 = next(t for t in db.list_todos() if t["email_key"] == c["key"])
+    assert todo_c2["id"] != todo_c["id"]
+    assert db.delete_todos([todo_c2["id"]]) == 1
+    assert db.get_email(c["key"])["status"] == db.DISCARDED
+
+    # 6. 丢弃再恢复（c 已在已丢弃里）
     assert db.set_status([b["key"]], db.DISCARDED) == 1
     assert db.set_status([b["key"]], db.DISCARDED) == 0       # 已是该状态的不计数
-    assert [e["key"] for e in db.list_emails(db.DISCARDED)] == [b["key"]]
+    assert [e["key"] for e in db.list_emails(db.DISCARDED)] == [b["key"], c["key"]]
     assert db.set_status([b["key"]], db.REVIEW) == 1
     assert db.get_email(b["key"])["status"] == db.REVIEW
-    assert db.list_emails(db.DISCARDED) == []
+    assert [e["key"] for e in db.list_emails(db.DISCARDED)] == [c["key"]]
 
     # 统计
     counts = db.count_by_status()
     assert counts["work"] == {db.NEW: 0, db.REVIEW: 1, db.TODO: 1, db.DISCARDED: 0}
-    assert counts["home"] == {db.NEW: 0, db.REVIEW: 0, db.TODO: 1, db.DISCARDED: 0}
+    assert counts["home"] == {db.NEW: 0, db.REVIEW: 0, db.TODO: 0, db.DISCARDED: 1}
 
     # 7. reset_to_new：状态改回 new，分析被删除
     assert db.reset_to_new([b["key"]]) == 1

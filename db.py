@@ -443,13 +443,29 @@ def undo_done(ids):
 
 
 def delete_todos(ids):
-    """批量删除待办。返回删了几条。注意：不改对应邮件的状态。"""
+    """批量删除待办，并把对应邮件从 todo 改为 discarded（同一事务）。返回删了几条。
+
+    邮件进入"已丢弃"后可以恢复为 review，再次加入待办会新建一条。
+    待办没有来源邮件、或邮件已不是 todo 状态时，只删待办，不改邮件。
+    """
     ids = _unique(ids)
     if not ids:
         return 0
+    now = _now()
+    deleted = 0
     with _connect() as conn, conn:
-        cur = conn.executemany("DELETE FROM todos WHERE id = ?", [(i,) for i in ids])
-        return cur.rowcount
+        for todo_id in ids:
+            row = conn.execute("SELECT email_key FROM todos WHERE id = ?", (todo_id,)).fetchone()
+            if row is None:                      # 待办已不存在，跳过
+                continue
+            conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+            deleted += 1
+            if row["email_key"] is not None:
+                conn.execute(
+                    "UPDATE emails SET status = ?, status_changed_at = ? WHERE key = ? AND status = ?",
+                    (DISCARDED, now, row["email_key"], TODO),
+                )
+    return deleted
 
 
 # ---------------------------------------------------------------- 统计

@@ -41,6 +41,9 @@ CATEGORIES = ("求职", "学业", "财务账单", "账号安全", "个人生活"
 # 限流重试：只对这些 HTTP 状态码重试（429 限流；500/503/504 服务端暂时不可用）
 RETRY_STATUS = {429, 500, 503, 504}
 RETRY_WAITS = (10, 30, 60)       # 第 1、2、3 次重试前分别等待的秒数（逐次加长），最多重试 3 次
+REQUEST_TIMEOUT_MS = 30_000      # 单次请求超时（毫秒）；SDK 默认不设超时，网络卡住时会一直等。
+                                 # SDK 内部还会自动重试 1 次（attempts=0 会被它改成 1），最坏约 60 秒
+
 
 MAX_ERROR_CHARS = 200            # 错误信息最多保留的字数（不含邮件正文和 key）
 
@@ -204,8 +207,10 @@ def build_input(email, account):
 def get_client():
     """创建（或复用）Gemini 客户端。
 
-    API key 从环境变量 GEMINI_API_KEY 读取。关闭 SDK 自带的自动重试（attempts=0），
-    重试统一由本文件的 analyze_with_retry 控制，避免两层重试叠加。
+    API key 从环境变量 GEMINI_API_KEY 读取。尽量关闭 SDK 自带的自动重试（attempts=0），
+    重试主要由本文件的 analyze_with_retry 控制。注意：google-genai 2.29.0 会把 0 改成 1，
+    Interactions 实际仍会在 429、5xx、断网、超时时自动重试 1 次，无法彻底关闭。
+    设置请求超时 REQUEST_TIMEOUT_MS：超时会抛异常，按普通失败处理（这封记为分析失败，继续下一封）。
     """
     global _client
     if _client is None:
@@ -213,7 +218,10 @@ def get_client():
         from google.genai import types
         _client = genai.Client(
             api_key=os.environ["GEMINI_API_KEY"],
-            http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=0)),
+            http_options=types.HttpOptions(
+                timeout=REQUEST_TIMEOUT_MS,
+                retry_options=types.HttpRetryOptions(attempts=0),
+            ),
         )
     return _client
 

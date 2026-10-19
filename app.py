@@ -549,17 +549,19 @@ def on_ask_delete(selected, account):
         if not selected:
             return (gr.Row(visible=False), gr.skip(), None,
                     todo_status_text(account, "没有勾选任何待办，未做任何操作。"))
-        question = f"将删除勾选的 {len(selected)} 条待办（删除后不能恢复），确定吗？"
+        question = (f"将删除勾选的 {len(selected)} 条待办（待办本身不能恢复），"
+                    f"对应邮件移到“已丢弃”，可在那里恢复到待审。确定吗？")
         return gr.Row(visible=True), question, list(selected), gr.skip()
     except Exception as e:
         return gr.skip(), gr.skip(), gr.skip(), f"**出错**：{md_escape(describe_error(e))}"
 
 
 def on_confirm_delete(pending, account, sort, edit_id):
-    """"删除"第二步：删除第一步记下的 id（只删仍未完成的），然后收起确认区并刷新。"""
+    """"删除"第二步：删除第一步记下的 id（只删仍未完成的），对应邮件移到已丢弃，然后收起确认区并刷新。"""
     try:
         deleted = db.delete_todos(only_open(pending or []))
-        return refresh_todo(account, sort, edit_id, f"已删除 {deleted} 条待办。")
+        return refresh_todo(account, sort, edit_id,
+                            f"已删除 {deleted} 条待办，对应邮件已移到“已丢弃”。")
     except Exception as e:
         return todo_error_outputs(e)
 
@@ -684,7 +686,8 @@ def on_restore(selected):
 def build_todo_tab(demo):
     """在当前位置搭建"待办"标签页的内容并绑定事件。
 
-    返回刷新本页的事件参数（fn / inputs / outputs），供分拣页"加入待办"之后用 .then 刷新。
+    返回 {"delete": "确认删除"的事件, "refresh": 刷新本页的事件参数（fn / inputs / outputs）}，
+    供 build_app 在删除之后刷新已丢弃页、在分拣页"加入待办"之后刷新本页。
     """
     with gr.Row():
         account_dd = gr.Dropdown([ALL] + account_aliases(), value=ALL, label="账号")
@@ -733,7 +736,8 @@ def build_todo_tab(demo):
     done_btn.click(on_mark_done, inputs=[open_list] + view, outputs=outputs)
     delete_btn.click(on_ask_delete, inputs=[open_list, account_dd],
                      outputs=[confirm_row, confirm_md, pending_ids, status_md])
-    confirm_btn.click(on_confirm_delete, inputs=[pending_ids] + view, outputs=outputs)
+    delete_event = confirm_btn.click(on_confirm_delete, inputs=[pending_ids] + view,
+                                     outputs=outputs)
     cancel_btn.click(on_cancel_delete, inputs=None, outputs=[confirm_row, pending_ids])
 
     # 只响应用户手动选择；刷新时 refresh_todo() 已经处理了编辑区
@@ -744,7 +748,8 @@ def build_todo_tab(demo):
                    outputs=outputs)
     undo_btn.click(on_undo_done, inputs=[done_list] + view, outputs=outputs)
 
-    return {"fn": on_todo_refresh, "inputs": view, "outputs": outputs}
+    return {"delete": delete_event,
+            "refresh": {"fn": on_todo_refresh, "inputs": view, "outputs": outputs}}
 
 
 def build_discarded_tab(demo):
@@ -833,13 +838,14 @@ def build_app():
             with gr.Tab("分拣"):
                 sort_tab = build_sort_tab(demo)
             with gr.Tab("待办"):
-                refresh_todo_tab = build_todo_tab(demo)
+                todo_tab = build_todo_tab(demo)
             with gr.Tab("已丢弃"):
                 discarded_tab = build_discarded_tab(demo)
         # 以下刷新都在前一个事件完成后（无论成败）进行，切到对应标签页立即可见
-        sort_tab["add"].then(**refresh_todo_tab)               # 加入待办 → 刷新待办页
+        sort_tab["add"].then(**todo_tab["refresh"])            # 加入待办 → 刷新待办页
         for event in sort_tab["discards"]:                     # 丢弃选中 / 确认丢弃 → 刷新已丢弃页
             event.then(**discarded_tab["refresh"])
+        todo_tab["delete"].then(**discarded_tab["refresh"])    # 删除待办 → 刷新已丢弃页
         discarded_tab["restore"].then(**sort_tab["refresh"])   # 恢复到待审 → 刷新分拣页
     return demo
 

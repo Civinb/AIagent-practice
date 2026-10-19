@@ -227,3 +227,9 @@ data/
 state/
 mail.db
 eval.csv
+
+# SQLite 临时文件和数据库备份（含邮件正文）
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
