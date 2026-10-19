@@ -1,13 +1,13 @@
-# 多 Gmail 邮件分拣工具的依赖（版本与当前 .venv 里已验证可用的一致）
-# 安装：.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Dependencies of the multi-Gmail mail triage tool (versions match those verified in the current .venv)
+# Install: .venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# Gmail API（authorize.py、fetch_mail.py）
+# Gmail API (authorize.py, fetch_mail.py)
 google-api-python-client==2.201.0
 google-auth-oauthlib==1.5.0
-google-auth==2.62.0          # fetch_mail.py 直接用到 google.oauth2 / google.auth
+google-auth==2.62.0          # fetch_mail.py uses google.oauth2 / google.auth directly
 
-# Gemini Interactions API（analyze.py）
+# Gemini Interactions API (analyze.py)
 google-genai==2.29.0
 
-# 网页界面（app.py）
+# Web UI (app.py)
 gradio==6.30.0

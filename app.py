@@ -1,14 +1,14 @@
-"""网页界面：用 Gradio Blocks 在本机浏览器里分拣邮件。
+"""Web UI: triage mail in the local browser with Gradio Blocks.
 
-用法（在项目文件夹里运行，fetch_mail.py 用相对路径读 accounts.json 和 tokens/）：
+Usage (run inside the project folder; fetch_mail.py reads accounts.json and tokens/ by relative path):
     python app.py
-然后打开终端里显示的地址（只监听 127.0.0.1，不对外公开）。
+Then open the address shown in the terminal (it only listens on 127.0.0.1 and is not public).
 
-三个标签页：
-    分拣    拉取并分析、筛选、勾选后加入待办或丢弃、查看单封详情
-    待办    查看未完成待办（带紧急标记）、标记完成、删除、编辑标题/截止日期/备注、撤销完成
-    已丢弃  查看最近丢弃的邮件，勾选后恢复到待审
-界面只读写本地数据库 mail.db，不发送、不删除、不修改 Gmail 里的任何邮件。
+Three tabs:
+    Triage     Fetch and analyze, filter, tick emails to add to to-dos or discard, view one email's details
+    To-dos     View open to-dos (with urgency marks), mark done, delete, edit title/deadline/note, undo done
+    Discarded  View recently discarded emails and restore ticked ones to review
+The UI only reads and writes the local database mail.db. It never sends, deletes or modifies any Gmail message.
 """
 
 import re
@@ -21,39 +21,40 @@ import analyze
 import db
 import fetch_mail
 
-# ---------------------------------------------------------------- 常量
+# ---------------------------------------------------------------- constants
 
-ALL = "全部"                                       # 筛选下拉框里"不筛选"的选项
+ALL = "All"                                        # The "no filter" option in filter dropdowns
 PRIORITY_CHOICES = [ALL, "P1", "P2", "P3", "P4"]
-DEFAULT_CHECKED_PRIORITIES = (1, 2)                # 默认勾选：P1/P2 且需要行动
-SUBJECT_MAX_CHARS = 30                             # 列表里主题最多显示的字数
-SENDER_MAX_CHARS = 20                              # 列表里发件人名最多显示的字数
-MAX_ERROR_CHARS = 200                              # 状态文字里错误信息最多显示的字数
+DEFAULT_CHECKED_PRIORITIES = (1, 2)                # Ticked by default: P1/P2 that need action
+SUBJECT_MAX_CHARS = 30                             # Maximum subject characters shown in the list
+SENDER_MAX_CHARS = 20                              # Maximum sender-name characters shown in the list
+MAX_ERROR_CHARS = 200                              # Maximum error-message characters shown in status text
 
-FETCH_SHARE = 0.5                                  # 进度条：前一半给拉取，后一半给分析
+FETCH_SHARE = 0.5                                  # Progress bar: first half for fetching, second half for analysis
 
-# 待办页
-SORT_CHOICES = [("按截止日期", db.SORT_DEADLINE), ("按优先级", db.SORT_PRIORITY)]
-DONE_LIMIT = 30                                    # "已完成"里最多显示最近完成的条数
-URGENT_DAYS = 3                                    # 剩 1–3 天的显示"🟡 剩 N 天"
-TITLE_MAX_CHARS = 40                               # 待办列表里标题最多显示的字数
+# To-dos tab
+SORT_CHOICES = [("By deadline", db.SORT_DEADLINE), ("By priority", db.SORT_PRIORITY)]
+DONE_LIMIT = 30                                    # Maximum number of recently completed items shown under "Done"
+URGENT_DAYS = 3                                    # Items with 1–3 days left show "🟡 N days left"
+TITLE_MAX_CHARS = 40                               # Maximum title characters shown in the to-do list
 
-# 已丢弃页
-DISCARDED_LIMIT = 100                              # 最多显示最近丢弃的封数
+# Discarded tab
+DISCARDED_LIMIT = 100                              # Maximum number of recently discarded emails shown
 
-_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|<>~])")   # Markdown 里需要转义的字符
-_DATE_FORMAT = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")  # 截止日期必须严格是 YYYY-MM-DD
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|<>~])")   # Characters that must be escaped in Markdown
+_DATE_FORMAT = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")  # A deadline must be exactly YYYY-MM-DD
 
 
-# ---------------------------------------------------------------- 文字工具
+# ---------------------------------------------------------------- text helpers
 
 def md_escape(text):
-    """转义 Markdown 特殊字符，防止邮件内容（不可信）被渲染成链接、图片等。"""
+    """Escape Markdown special characters so email content (untrusted) cannot render as links, images, etc."""
     return _MD_SPECIAL.sub(r"\\\1", "" if text is None else str(text))
 
 
 def code_block(text):
-    """把正文原样放进代码块；围栏比正文里最长的连续反引号还长，正文无法提前结束代码块。"""
+    """Put the body verbatim in a code block; the fence is longer than the longest run of backticks
+    in the body, so the body cannot end the code block early."""
     text = text or ""
     longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
     fence = "`" * max(3, longest + 1)
@@ -61,19 +62,19 @@ def code_block(text):
 
 
 def truncate(text, limit):
-    """超过 limit 字就截断并加省略号。"""
+    """Truncate text longer than limit characters and add an ellipsis."""
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit] + "…"
 
 
 def sender_name(sender):
-    """发件人显示名：有名字用名字，没有就用邮箱地址。"""
+    """Sender display name: the name if there is one, otherwise the email address."""
     name, address = parseaddr(sender or "")
-    return name or address or "（未知发件人）"
+    return name or address or "(unknown sender)"
 
 
 def short_date(deadline):
-    """YYYY-MM-DD → 10/17；格式不对就原样返回。"""
+    """YYYY-MM-DD → 10/17; returned unchanged if the format is wrong."""
     try:
         d = datetime.strptime(deadline, "%Y-%m-%d")
     except (TypeError, ValueError):
@@ -82,35 +83,36 @@ def short_date(deadline):
 
 
 def describe_error(err):
-    """简短的错误说明：类型 + 前 MAX_ERROR_CHARS 个字。"""
-    return f"{type(err).__name__}：{str(err)[:MAX_ERROR_CHARS]}"
+    """Short error description: type + the first MAX_ERROR_CHARS characters."""
+    return f"{type(err).__name__}: {str(err)[:MAX_ERROR_CHARS]}"
 
 
-# ---------------------------------------------------------------- 筛选
+# ---------------------------------------------------------------- filters
 
 def account_filter(value):
-    """账号下拉框的值 → db.list_emails 的 account 参数（"全部"为 None）。"""
+    """Account dropdown value → the account argument of db.list_emails ("All" is None)."""
     return None if value in (None, ALL) else value
 
 
 def priority_filter(value):
-    """优先级下拉框的值 → db.list_emails 的 priority 参数（"P1" → 1，"全部"为 None）。"""
+    """Priority dropdown value → the priority argument of db.list_emails ("P1" → 1, "All" is None)."""
     return None if value in (None, ALL) else int(value[1:])
 
 
 def describe_filter(account, priority):
-    """筛选条件的文字说明，如"work 账号"、"全部账号、优先级 P1"。"""
-    text = "全部账号" if account_filter(account) is None else f"{account} 账号"
+    """Text description of the filter, e.g. "account work" or "all accounts, priority P1"."""
+    text = "all accounts" if account_filter(account) is None else f"account {account}"
     if priority_filter(priority) is not None:
-        text += f"、优先级 {priority}"
+        text += f", priority {priority}"
     return text
 
 
 def account_aliases():
-    """账号别名列表：accounts.json 里启用的账号在前，库里有邮件但不在清单里的账号补在后面。"""
+    """List of account aliases: enabled accounts in accounts.json first, then accounts that have
+    mail in the database but are not in the list."""
     try:
         aliases = [a["alias"] for a in fetch_mail.load_accounts()]
-    except (OSError, ValueError, KeyError):         # 清单读不了时只用库里的账号
+    except (OSError, ValueError, KeyError):         # If the list cannot be read, use only the database's accounts
         aliases = []
     for alias in db.count_by_status():
         if alias not in aliases:
@@ -119,44 +121,45 @@ def account_aliases():
 
 
 def list_review(account, priority):
-    """当前筛选下的待审邮件。"""
+    """Emails to review under the current filter."""
     return db.list_emails(db.REVIEW, account=account_filter(account),
                           priority=priority_filter(priority))
 
 
 def only_review(keys):
-    """只保留现在仍是待审状态的 key（界面可能过期，防止把已处理的邮件再改一次）。"""
+    """Keep only keys that are still in review now (the UI may be stale; avoids changing an
+    already handled email again)."""
     review = {e["key"] for e in db.list_emails(db.REVIEW)}
     return [k for k in keys if k in review]
 
 
-# ---------------------------------------------------------------- 列表显示
+# ---------------------------------------------------------------- list display
 
 def analysis_failed(email):
-    """分析失败（或没有分析记录）的邮件。"""
+    """Emails whose analysis failed (or that have no analysis record)."""
     a = email["analysis"]
     return a is None or bool(a["error"])
 
 
 def email_label(email):
-    """待审列表里一封邮件的显示文字。"""
+    """Display text for one email in the review list."""
     sender = truncate(sender_name(email["sender"]), SENDER_MAX_CHARS)
-    subject = truncate(email["subject"], SUBJECT_MAX_CHARS) or "（无主题）"
+    subject = truncate(email["subject"], SUBJECT_MAX_CHARS) or "(no subject)"
     if analysis_failed(email):
-        return f"⚠ 分析失败 | {email['account']} | {sender} | {subject}"
+        return f"⚠ Analysis failed | {email['account']} | {sender} | {subject}"
 
     a = email["analysis"]
     text = subject
     if a["action"]:
         text += f" → {a['action']}"
     if a["deadline"]:
-        text += f"（截止 {short_date(a['deadline'])}）"
+        text += f" (due {short_date(a['deadline'])})"
     label = f"P{a['priority']} | {email['account']} | {sender} | {text}"
-    return "⚠ 疑似钓鱼 " + label if a["suspicious"] else label
+    return "⚠ Possible phishing " + label if a["suspicious"] else label
 
 
 def default_checked(email):
-    """是否默认勾选：分析成功、优先级为 P1/P2、需要行动。"""
+    """Whether it is ticked by default: analysis succeeded, priority P1/P2, needs action."""
     if analysis_failed(email):
         return False
     a = email["analysis"]
@@ -164,60 +167,61 @@ def default_checked(email):
 
 
 def status_text(message=""):
-    """状态文字：各账号待审数量 + 上一次操作的结果。"""
+    """Status text: number of emails to review per account + the result of the last action."""
     counts = db.count_by_status()
     per_account = [(alias, counts.get(alias, {}).get(db.REVIEW, 0)) for alias in account_aliases()]
     total = sum(n for _, n in per_account)
-    parts = "，".join(f"{md_escape(alias)} {n} 封" for alias, n in per_account) or "无账号"
-    text = f"**待审**：{parts}（共 {total} 封）"
+    parts = ", ".join(f"{md_escape(alias)} {n}" for alias, n in per_account) or "no accounts"
+    text = f"**To review**: {parts} ({total} in total)"
     return text + "\n\n" + message if message else text
 
 
-# ---------------------------------------------------------------- 详情
+# ---------------------------------------------------------------- details
 
 def detail_text(key):
-    """一封待审邮件的详情 Markdown；没选或已不在待审时给出提示。"""
+    """Markdown details of one email to review; a hint if nothing is selected or it is no longer in review."""
     if not key:
-        return "选择一封邮件查看详情。"
+        return "Select an email to view its details."
     email = db.get_email(key)
     if email is None or email["status"] != db.REVIEW:
-        return "这封邮件已不在待审列表。"
+        return "This email is no longer in the review list."
 
     a = email["analysis"] or {}
-    attachments = "、".join(md_escape(n) for n in email["attachments"]) or "无"
+    attachments = ", ".join(md_escape(n) for n in email["attachments"]) or "none"
     lines = [
-        f"### {md_escape(email['subject']) or '（无主题）'}",
+        f"### {md_escape(email['subject']) or '(no subject)'}",
         "",
-        f"- 账号：{md_escape(email['account'])}",
-        f"- 发件人：{md_escape(email['sender'])}",
-        f"- 接收时间：{md_escape(email['received_at'])}",
+        f"- Account: {md_escape(email['account'])}",
+        f"- From: {md_escape(email['sender'])}",
+        f"- Received: {md_escape(email['received_at'])}",
     ]
     if analysis_failed(email):
-        lines += [f"- **⚠ 分析失败**：{md_escape(a.get('error') or '没有分析记录')}"]
+        lines += [f"- **⚠ Analysis failed**: {md_escape(a.get('error') or 'no analysis record')}"]
     else:
         lines += [
-            f"- 优先级：P{a['priority']}　类别：{md_escape(a['category'])}"
-            f"　需要行动：{'是' if a['needs_action'] else '否'}",
-            f"- 该做什么：{md_escape(a['action']) or '无'}",
-            f"- 截止日期：{md_escape(a['deadline']) or '无'}",
+            f"- Priority: P{a['priority']} · Category: {md_escape(a['category'])}"
+            f" · Needs action: {'yes' if a['needs_action'] else 'no'}",
+            f"- What to do: {md_escape(a['action']) or 'nothing'}",
+            f"- Deadline: {md_escape(a['deadline']) or 'none'}",
         ]
         if a["suspicious"]:
-            lines += ["- **⚠ 疑似钓鱼**"]
-    lines += [f"- 附件：{attachments}"]
+            lines += ["- **⚠ Possible phishing**"]
+    lines += [f"- Attachments: {attachments}"]
     if not analysis_failed(email):
-        lines += ["", f"**AI 摘要**：{md_escape(a['summary'])}",
-                  "", f"**判断理由**：{md_escape(a['reason'])}"]
-    lines += ["", "**正文**", "", code_block(email["body"])]
+        lines += ["", f"**AI summary**: {md_escape(a['summary'])}",
+                  "", f"**Reasoning**: {md_escape(a['reason'])}"]
+    lines += ["", "**Body**", "", code_block(email["body"])]
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------- 刷新
+# ---------------------------------------------------------------- refresh
 
 def refresh(account, priority, detail_key, message=""):
-    """按当前筛选重新生成分拣页，返回值顺序与 SORT_OUTPUTS 一致：
+    """Rebuild the Triage tab for the current filter; the return order matches SORT_OUTPUTS:
 
-    (待审列表, 状态文字, 详情下拉框, 详情, 确认区, 待确认的 key)
-    待审列表的勾选重置为默认勾选；详情下拉框尽量保持原来选中的邮件；确认区一律收起。
+    (review list, status text, details dropdown, details, confirm row, keys awaiting confirmation)
+    Ticks in the review list are reset to the defaults; the details dropdown keeps the previously
+    selected email when possible; the confirm row is always hidden.
     """
     emails = list_review(account, priority)
     choices = [(email_label(e), e["key"]) for e in emails]
@@ -235,55 +239,56 @@ def refresh(account, priority, detail_key, message=""):
 
 
 def error_outputs(err):
-    """出错时：只在状态文字里显示错误，其他输出保持不变。"""
-    return (gr.skip(), f"**出错**：{md_escape(describe_error(err))}",
+    """On error: show the error only in the status text and leave the other outputs unchanged."""
+    return (gr.skip(), f"**Error**: {md_escape(describe_error(err))}",
             gr.skip(), gr.skip(), gr.skip(), gr.skip())
 
 
 def message_only(message):
-    """只更新状态文字（例如没勾选就点了按钮），其他输出保持不变。"""
+    """Update only the status text (e.g. a button clicked with nothing ticked); other outputs unchanged."""
     return (gr.skip(), status_text(message), gr.skip(), gr.skip(), gr.skip(), gr.skip())
 
 
-# ---------------------------------------------------------------- 拉取并分析
+# ---------------------------------------------------------------- fetch and analyze
 
 def scaled_progress(progress, start, share):
-    """把 0–1 的子进度映射到总进度条的 [start, start + share] 区间，返回回调 f(fraction, message)。"""
+    """Map a 0–1 sub-progress onto [start, start + share] of the overall progress bar;
+    returns a callback f(fraction, message)."""
     def callback(fraction, message):
         progress(start + share * fraction, desc=message)
     return callback
 
 
 def pull_message(fetch_summary, analyze_summary):
-    """把拉取汇总和分析汇总排成状态文字。"""
-    fetched = "；".join(
-        f"{md_escape(alias)} 找到 {s['found']} 封，新增 {s['new']} 封，失败 {s['failed']} 封"
-        for alias, s in fetch_summary["accounts"].items()) or "没有成功连接的账号"
-    text = (f"**拉取**：{fetched}\n\n"
-            f"**分析**：成功 {analyze_summary['analyzed']} 封，失败 {analyze_summary['failed']} 封")
+    """Format the fetch summary and analysis summary as status text."""
+    fetched = "; ".join(
+        f"{md_escape(alias)} found {s['found']}, new {s['new']}, failed {s['failed']}"
+        for alias, s in fetch_summary["accounts"].items()) or "no account connected successfully"
+    text = (f"**Fetch**: {fetched}\n\n"
+            f"**Analysis**: {analyze_summary['analyzed']} succeeded, {analyze_summary['failed']} failed")
     problems = fetch_summary["problems"] + analyze_summary["errors"]
     if problems:
-        text += "\n\n**问题**：\n" + "\n".join(f"- {md_escape(p)}" for p in problems)
+        text += "\n\n**Problems**:\n" + "\n".join(f"- {md_escape(p)}" for p in problems)
     return text
 
 
 def on_pull(account, priority, detail_key, progress=gr.Progress()):
-    """拉取所有账号的新邮件并分析，完成后刷新。"""
+    """Fetch new mail for all accounts and analyze it, then refresh."""
     try:
-        progress(0, desc="开始拉取……")
+        progress(0, desc="Starting fetch...")
         fetch_summary = fetch_mail.fetch_all(progress=scaled_progress(progress, 0, FETCH_SHARE))
-        progress(FETCH_SHARE, desc="开始分析……")
+        progress(FETCH_SHARE, desc="Starting analysis...")
         analyze_summary = analyze.analyze_pending(
             progress=scaled_progress(progress, FETCH_SHARE, 1 - FETCH_SHARE))
         return refresh(account, priority, detail_key, pull_message(fetch_summary, analyze_summary))
-    except Exception as e:                            # 任何异常都只显示在状态文字里
+    except Exception as e:                            # Any exception is shown only in the status text
         return error_outputs(e)
 
 
-# ---------------------------------------------------------------- 其他事件
+# ---------------------------------------------------------------- other events
 
 def on_refresh(account, priority, detail_key):
-    """打开页面、改筛选时刷新。"""
+    """Refresh when the page opens or a filter changes."""
     try:
         return refresh(account, priority, detail_key)
     except Exception as e:
@@ -291,86 +296,91 @@ def on_refresh(account, priority, detail_key):
 
 
 def on_add_todos(selected, account, priority, detail_key):
-    """把勾选的邮件加入待办。"""
+    """Add the ticked emails to the to-do list."""
     try:
         if not selected:
-            return message_only("没有勾选任何邮件，未做任何操作。")
+            return message_only("No emails are ticked; nothing was done.")
         created = db.add_todos(only_review(selected))
-        return refresh(account, priority, detail_key, f"已加入待办 {created} 封。")
+        return refresh(account, priority, detail_key, f"Added {created} emails to to-dos.")
     except Exception as e:
         return error_outputs(e)
 
 
 def on_discard_selected(selected, account, priority, detail_key):
-    """丢弃勾选的邮件。"""
+    """Discard the ticked emails."""
     try:
         if not selected:
-            return message_only("没有勾选任何邮件，未做任何操作。")
+            return message_only("No emails are ticked; nothing was done.")
         changed = db.set_status(only_review(selected), db.DISCARDED)
-        return refresh(account, priority, detail_key, f"已丢弃 {changed} 封。")
+        return refresh(account, priority, detail_key, f"Discarded {changed} emails.")
     except Exception as e:
         return error_outputs(e)
 
 
 def on_ask_discard_rest(selected, account, priority):
-    """"其余全部丢弃"第一步：算出当前筛选下未勾选的 key，显示确认区。
+    """"Discard all the rest", step 1: work out the unticked keys under the current filter and show the confirm row.
 
-    返回 (确认区, 确认说明, 待确认的 key, 状态文字)。
+    Returns (confirm row, confirm text, keys awaiting confirmation, status text).
     """
     try:
         chosen = set(selected or [])
         rest = [e["key"] for e in list_review(account, priority) if e["key"] not in chosen]
         if not rest:
             return (gr.Row(visible=False), gr.skip(), None,
-                    status_text(f"{describe_filter(account, priority)}下没有未勾选的邮件，未做任何操作。"))
-        question = f"将丢弃（{md_escape(describe_filter(account, priority))}）未勾选的 {len(rest)} 封，确定吗？"
+                    status_text(f"There are no unticked emails under {describe_filter(account, priority)}; "
+                                f"nothing was done."))
+        question = (f"This will discard the {len(rest)} unticked emails "
+                    f"({md_escape(describe_filter(account, priority))}). Are you sure?")
         return gr.Row(visible=True), question, rest, gr.skip()
     except Exception as e:
-        return gr.skip(), gr.skip(), gr.skip(), f"**出错**：{md_escape(describe_error(e))}"
+        return gr.skip(), gr.skip(), gr.skip(), f"**Error**: {md_escape(describe_error(e))}"
 
 
 def on_confirm_discard_rest(pending, account, priority, detail_key):
-    """"其余全部丢弃"第二步：丢弃第一步记下的 key，然后收起确认区、清空记录并刷新。"""
+    """"Discard all the rest", step 2: discard the keys recorded in step 1, then hide the confirm row,
+    clear the record and refresh."""
     try:
         changed = db.set_status(only_review(pending or []), db.DISCARDED)
-        return refresh(account, priority, detail_key, f"已丢弃 {changed} 封。")
+        return refresh(account, priority, detail_key, f"Discarded {changed} emails.")
     except Exception as e:
         return error_outputs(e)
 
 
 def on_cancel_discard_rest():
-    """取消：只收起确认区、清空记录。返回 (确认区, 待确认的 key)。"""
+    """Cancel: only hide the confirm row and clear the record. Returns (confirm row, keys awaiting confirmation)."""
     return gr.Row(visible=False), None
 
 
 def on_select_detail(key):
-    """详情下拉框选中一封邮件时显示详情。"""
+    """Show the details when an email is chosen in the details dropdown."""
     try:
         return detail_text(key)
     except Exception as e:
-        return f"**出错**：{md_escape(describe_error(e))}"
+        return f"**Error**: {md_escape(describe_error(e))}"
 
 
-# ================================================================ 待办页
+# ================================================================ To-dos tab
 
-# ---------------------------------------------------------------- 日期
+# ---------------------------------------------------------------- dates
 
 def parse_deadline(text):
-    """校验编辑框里的截止日期：空 → None；严格的 YYYY-MM-DD 且是真实日期 → 原样返回。
+    """Validate the deadline in the edit box: empty → None; strict YYYY-MM-DD that is a real date →
+    returned unchanged.
 
-    不合法时抛 ValueError（例如"下周五"、"2026-2-3"、"2026-02-30"）。
+    Raises ValueError if invalid (e.g. "next Friday", "2026-2-3", "2026-02-30").
     """
     text = (text or "").strip()
     if not text:
         return None
     if not _DATE_FORMAT.match(text):
-        raise ValueError("格式不是 YYYY-MM-DD")
-    datetime.strptime(text, "%Y-%m-%d")             # 2026-02-30 这类不存在的日期会抛 ValueError
+        raise ValueError("format is not YYYY-MM-DD")
+    datetime.strptime(text, "%Y-%m-%d")             # Dates that do not exist, such as 2026-02-30, raise ValueError
     return text
 
 
 def days_left(deadline, today):
-    """距离截止日期还有几天（今天到期为 0，已过期为负数）；无截止日期或格式不对时返回 None。"""
+    """Days left until the deadline (0 if due today, negative if overdue); None if there is no
+    deadline or the format is wrong."""
     try:
         d = datetime.strptime(deadline, "%Y-%m-%d").date()
     except (TypeError, ValueError):
@@ -379,21 +389,22 @@ def days_left(deadline, today):
 
 
 def urgency_mark(deadline, today):
-    """紧急标记：已过期 / 今天到期 / 剩 1–3 天；其余或无截止日期返回空字符串。"""
+    """Urgency mark: overdue / due today / 1–3 days left; an empty string otherwise or when there is no deadline."""
     n = days_left(deadline, today)
     if n is None or n > URGENT_DAYS:
         return ""
     if n < 0:
-        return "🔴 已过期"
+        return "🔴 Overdue"
     if n == 0:
-        return "🟡 今天到期"
-    return f"🟡 剩 {n} 天"
+        return "🟡 Due today"
+    return f"🟡 {n} days left"
 
 
-# ---------------------------------------------------------------- 待办列表显示
+# ---------------------------------------------------------------- to-do list display
 
 def todo_email(todo, cache):
-    """待办对应的来源邮件（带分析）；没有来源或邮件已不在库里时返回 None。cache 避免重复查询。"""
+    """The to-do's source email (with analysis); None if there is no source or the email is no
+    longer in the database. cache avoids repeated queries."""
     key = todo["email_key"]
     if not key:
         return None
@@ -403,92 +414,96 @@ def todo_email(todo, cache):
 
 
 def todo_parts(todo, email):
-    """待办显示文字的公共部分：[标题, 截止, 账号 · 发件人]。"""
-    title = truncate(todo["title"], TITLE_MAX_CHARS) or "（无标题）"
-    deadline = f"截止 {short_date(todo['deadline'])}" if todo["deadline"] else "无截止日期"
+    """The shared part of a to-do's display text: [title, deadline, account · sender]."""
+    title = truncate(todo["title"], TITLE_MAX_CHARS) or "(no title)"
+    deadline = f"due {short_date(todo['deadline'])}" if todo["deadline"] else "no deadline"
     sender = truncate(sender_name(email["sender"] if email else None), SENDER_MAX_CHARS)
     return [title, deadline, f"{todo['account']} · {sender}"]
 
 
 def todo_label(todo, email, today):
-    """未完成待办的显示文字，如"🔴 已过期 | 标题 | 截止 10/17 | work · 发件人"。"""
+    """Display text of an open to-do, e.g. "🔴 Overdue | title | due 10/17 | work · sender"."""
     mark = urgency_mark(todo["deadline"], today)
     return " | ".join(([mark] if mark else []) + todo_parts(todo, email))
 
 
 def done_label(todo, email):
-    """已完成待办的显示文字，如"标题 | 截止 10/17 | work · 发件人 | 完成于 10/18"。"""
+    """Display text of a completed to-do, e.g. "title | due 10/17 | work · sender | done 10/18"."""
     done_day = short_date((todo["done_at"] or "")[:10])
-    return " | ".join(todo_parts(todo, email) + [f"完成于 {done_day}"])
+    return " | ".join(todo_parts(todo, email) + [f"done {done_day}"])
 
 
 def list_open(account, sort):
-    """当前账号筛选下的未完成待办，按所选方式排序。"""
+    """Open to-dos under the current account filter, in the chosen order."""
     return db.list_todos(done=False, account=account_filter(account), sort=sort)
 
 
 def list_recent_done(account):
-    """当前账号筛选下最近完成的 DONE_LIMIT 条（按完成时间倒序）。"""
+    """The DONE_LIMIT most recently completed to-dos under the current account filter (newest completion first)."""
     done = db.list_todos(done=True, account=account_filter(account))
     done.sort(key=lambda t: t["done_at"] or "", reverse=True)
     return done[:DONE_LIMIT]
 
 
 def only_open(ids):
-    """只保留现在仍未完成的待办 id（界面可能过期，防止误删已完成的）。"""
+    """Keep only to-do ids that are still open now (the UI may be stale; avoids deleting completed ones by mistake)."""
     open_ids = {t["id"] for t in db.list_todos(done=False)}
     return [i for i in ids if i in open_ids]
 
 
 def todo_status_text(account, message=""):
-    """待办页状态文字：当前筛选下未完成的数量、已过期 / 3 天内到期的数量 + 上一次操作的结果。"""
-    where = "全部账号" if account_filter(account) is None else f"{account} 账号"
+    """To-dos tab status text: number of open items under the current filter, number overdue /
+    due within 3 days + the result of the last action."""
+    where = "all accounts" if account_filter(account) is None else f"account {account}"
     today = date.today()
     left = [days_left(t["deadline"], today) for t in list_open(account, db.SORT_DEADLINE)]
     overdue = sum(1 for n in left if n is not None and n < 0)
     soon = sum(1 for n in left if n is not None and 0 <= n <= URGENT_DAYS)
-    text = (f"**未完成**：{md_escape(where)} {len(left)} 条\n\n"
-            f"🔴 已过期 {overdue} 条　🟡 {URGENT_DAYS} 天内到期 {soon} 条")
+    text = (f"**Open**: {len(left)} in {md_escape(where)}\n\n"
+            f"🔴 {overdue} overdue · 🟡 {soon} due within {URGENT_DAYS} days")
     return text + "\n\n" + message if message else text
 
 
-# ---------------------------------------------------------------- 编辑区
+# ---------------------------------------------------------------- editor
 
 def source_text(todo):
-    """编辑区下方的来源邮件说明：发件人、主题、AI 摘要。"""
+    """Source-email description below the editor: sender, subject, AI summary."""
     email = todo_email(todo, {})
     if email is None:
-        return "找不到来源邮件。"
+        return "Source email not found."
     a = email["analysis"]
-    summary = md_escape(a["summary"]) if a and not a["error"] and a["summary"] else "无"
+    summary = md_escape(a["summary"]) if a and not a["error"] and a["summary"] else "none"
     return "\n".join([
-        "**来源邮件**",
+        "**Source email**",
         "",
-        f"- 发件人：{md_escape(email['sender']) or '（未知发件人）'}",
-        f"- 主题：{md_escape(email['subject']) or '（无主题）'}",
-        f"- AI 摘要：{summary}",
+        f"- From: {md_escape(email['sender']) or '(unknown sender)'}",
+        f"- Subject: {md_escape(email['subject']) or '(no subject)'}",
+        f"- AI summary: {summary}",
     ])
 
 
 def editor_values(todo_id):
-    """编辑区四个输出：(标题, 截止日期, 备注, 来源说明)。没选或待办已不存在时清空。"""
+    """The editor's four outputs: (title, deadline, note, source description). Cleared if nothing
+    is selected or the to-do no longer exists."""
     todo = db.get_todo(todo_id) if todo_id is not None else None
     if todo is None or todo["done"]:
-        return "", "", "", "选择一条待办进行编辑。"
+        return "", "", "", "Select a to-do to edit."
     return todo["title"], todo["deadline"] or "", todo["note"] or "", source_text(todo)
 
 
-# ---------------------------------------------------------------- 刷新
+# ---------------------------------------------------------------- refresh
 
 def refresh_todo(account, sort, edit_id, message="", reload_editor=False):
-    """重新生成待办页，返回值顺序与 build_todo_tab 里的 outputs 一致：
+    """Rebuild the To-dos tab; the return order matches outputs in build_todo_tab:
 
-    (未完成列表, 编辑下拉框, 标题, 截止日期, 备注, 来源说明, 已完成列表, 确认区, 待确认的 id, 状态文字)
-    两个列表的勾选清空；确认区收起。编辑下拉框尽量保持原来选中的待办：
-    选中的还在时编辑框保持不动（不覆盖没保存的修改），reload_editor=True 时从数据库重新填入；
-    选中的已不在未完成列表时清空编辑区。
+    (open list, edit dropdown, title, deadline, note, source description, done list, confirm row,
+     ids awaiting confirmation, status text)
+    Ticks in both lists are cleared; the confirm row is hidden. The edit dropdown keeps the
+    previously selected to-do when possible: if it is still there, the edit boxes are left alone
+    (unsaved changes are not overwritten), and reload_editor=True refills them from the database;
+    if it is no longer in the open list, the editor is cleared.
     """
-    today = date.today()                            # 紧急标记按本地日期计算
+    today = date.today()                            # Urgency marks use the local date
     cache = {}
     open_todos = list_open(account, sort)
     choices = [(todo_label(t, todo_email(t, cache), today), t["id"]) for t in open_todos]
@@ -513,19 +528,19 @@ def refresh_todo(account, sort, edit_id, message="", reload_editor=False):
 
 
 def todo_error_outputs(err):
-    """出错时：只在状态文字里显示错误，其他输出保持不变。"""
-    return (gr.skip(),) * 9 + (f"**出错**：{md_escape(describe_error(err))}",)
+    """On error: show the error only in the status text and leave the other outputs unchanged."""
+    return (gr.skip(),) * 9 + (f"**Error**: {md_escape(describe_error(err))}",)
 
 
 def todo_message_only(account, message):
-    """只更新状态文字（例如没勾选就点了按钮），其他输出保持不变。"""
+    """Update only the status text (e.g. a button clicked with nothing ticked); other outputs unchanged."""
     return (gr.skip(),) * 9 + (todo_status_text(account, message),)
 
 
-# ---------------------------------------------------------------- 待办页事件
+# ---------------------------------------------------------------- To-dos tab events
 
 def on_todo_refresh(account, sort, edit_id):
-    """打开页面、改筛选/排序、分拣页加入待办之后刷新。"""
+    """Refresh when the page opens, the filter/sort changes, or after "Add to to-dos" on the Triage tab."""
     try:
         return refresh_todo(account, sort, edit_id)
     except Exception as e:
@@ -533,122 +548,130 @@ def on_todo_refresh(account, sort, edit_id):
 
 
 def on_mark_done(selected, account, sort, edit_id):
-    """把勾选的待办标记为已完成。"""
+    """Mark the ticked to-dos as done."""
     try:
         if not selected:
-            return todo_message_only(account, "没有勾选任何待办，未做任何操作。")
+            return todo_message_only(account, "No to-dos are ticked; nothing was done.")
         changed = db.mark_done(selected)
-        return refresh_todo(account, sort, edit_id, f"已标记完成 {changed} 条。")
+        return refresh_todo(account, sort, edit_id, f"Marked {changed} as done.")
     except Exception as e:
         return todo_error_outputs(e)
 
 
 def on_ask_delete(selected, account):
-    """"删除"第一步：记下勾选的 id，显示确认区。返回 (确认区, 确认说明, 待确认的 id, 状态文字)。"""
+    """"Delete", step 1: record the ticked ids and show the confirm row.
+    Returns (confirm row, confirm text, ids awaiting confirmation, status text)."""
     try:
         if not selected:
             return (gr.Row(visible=False), gr.skip(), None,
-                    todo_status_text(account, "没有勾选任何待办，未做任何操作。"))
-        question = (f"将删除勾选的 {len(selected)} 条待办（待办本身不能恢复），"
-                    f"对应邮件移到“已丢弃”，可在那里恢复到待审。确定吗？")
+                    todo_status_text(account, "No to-dos are ticked; nothing was done."))
+        question = (f"This will delete the {len(selected)} ticked to-dos (the to-dos themselves cannot be "
+                    f"restored). Their emails move to \"Discarded\", where they can be restored to review. "
+                    f"Are you sure?")
         return gr.Row(visible=True), question, list(selected), gr.skip()
     except Exception as e:
-        return gr.skip(), gr.skip(), gr.skip(), f"**出错**：{md_escape(describe_error(e))}"
+        return gr.skip(), gr.skip(), gr.skip(), f"**Error**: {md_escape(describe_error(e))}"
 
 
 def on_confirm_delete(pending, account, sort, edit_id):
-    """"删除"第二步：删除第一步记下的 id（只删仍未完成的），对应邮件移到已丢弃，然后收起确认区并刷新。"""
+    """"Delete", step 2: delete the ids recorded in step 1 (only those still open), move their emails
+    to discarded, then hide the confirm row and refresh."""
     try:
         deleted = db.delete_todos(only_open(pending or []))
         return refresh_todo(account, sort, edit_id,
-                            f"已删除 {deleted} 条待办，对应邮件已移到“已丢弃”。")
+                            f"Deleted {deleted} to-dos; their emails moved to \"Discarded\".")
     except Exception as e:
         return todo_error_outputs(e)
 
 
 def on_cancel_delete():
-    """取消删除：只收起确认区、清空记录。返回 (确认区, 待确认的 id)。"""
+    """Cancel deletion: only hide the confirm row and clear the record. Returns (confirm row, ids awaiting confirmation)."""
     return gr.Row(visible=False), None
 
 
 def on_select_todo(todo_id):
-    """编辑下拉框选中一条待办时，把标题、截止日期、备注、来源说明填入编辑区。"""
+    """When a to-do is chosen in the edit dropdown, fill the editor with its title, deadline, note and source."""
     try:
         return editor_values(todo_id)
     except Exception as e:
-        return gr.skip(), gr.skip(), gr.skip(), f"**出错**：{md_escape(describe_error(e))}"
+        return gr.skip(), gr.skip(), gr.skip(), f"**Error**: {md_escape(describe_error(e))}"
 
 
 def on_save_todo(edit_id, title, deadline, note, account, sort):
-    """保存编辑：截止日期必须为空或合法日期，不合法只提示、不保存。只改待办表。"""
+    """Save edits: the deadline must be empty or a valid date; if invalid, only show a hint and do
+    not save. Only the to-dos table is changed."""
     try:
         if edit_id is None:
-            return todo_message_only(account, "请先在下拉框里选择一条待办。")
+            return todo_message_only(account, "Please choose a to-do in the dropdown first.")
         title = (title or "").strip()
         if not title:
-            return todo_message_only(account, "标题不能为空，未保存。")
+            return todo_message_only(account, "The title cannot be empty; not saved.")
         try:
             deadline = parse_deadline(deadline)
         except ValueError:
             return todo_message_only(
-                account, f"截止日期“{md_escape(deadline)}”不合法，请填 YYYY-MM-DD 或留空。未保存。")
+                account, f"The deadline \"{md_escape(deadline)}\" is invalid; use YYYY-MM-DD or leave it "
+                         f"empty. Not saved.")
         if not db.update_todo(edit_id, title, deadline, (note or "").strip()):
-            return refresh_todo(account, sort, None, "这条待办已不存在，未保存。")
-        return refresh_todo(account, sort, edit_id, "已保存。", reload_editor=True)
+            return refresh_todo(account, sort, None, "This to-do no longer exists; not saved.")
+        return refresh_todo(account, sort, edit_id, "Saved.", reload_editor=True)
     except Exception as e:
         return todo_error_outputs(e)
 
 
 def on_undo_done(selected, account, sort, edit_id):
-    """把"已完成"里勾选的待办改回未完成。"""
+    """Set the to-dos ticked under "Done" back to open."""
     try:
         if not selected:
-            return todo_message_only(account, "没有勾选任何已完成的待办，未做任何操作。")
+            return todo_message_only(account, "No completed to-dos are ticked; nothing was done.")
         changed = db.undo_done(selected)
-        return refresh_todo(account, sort, edit_id, f"已撤销完成 {changed} 条。")
+        return refresh_todo(account, sort, edit_id, f"Undid completion for {changed}.")
     except Exception as e:
         return todo_error_outputs(e)
 
 
-# ================================================================ 已丢弃页
+# ================================================================ Discarded tab
 
-# ---------------------------------------------------------------- 列表显示
+# ---------------------------------------------------------------- list display
 
 def discard_time(email):
-    """丢弃时间的显示文字：status_changed_at（ISO 格式）→ 10/18 19:25；格式不对就原样返回。"""
+    """Display text of the discard time: status_changed_at (ISO format) → 10/18 19:25; returned
+    unchanged if the format is wrong."""
     value = email["status_changed_at"]
     try:
         t = datetime.fromisoformat(value)
     except (TypeError, ValueError):
-        return value or "（时间未知）"
+        return value or "(time unknown)"
     return f"{t.month}/{t.day} {t:%H:%M}"
 
 
 def discarded_label(email):
-    """已丢弃列表里一封邮件的显示文字：丢弃时间 + 与分拣页相同的文字。"""
-    return f"丢弃于 {discard_time(email)} | {email_label(email)}"
+    """Display text of one email in the discarded list: discard time + the same text as on the Triage tab."""
+    return f"Discarded {discard_time(email)} | {email_label(email)}"
 
 
 def only_discarded(keys):
-    """只保留现在仍是已丢弃状态的 key（界面可能过期，防止把已处理的邮件再改一次）。"""
+    """Keep only keys that are still discarded now (the UI may be stale; avoids changing an
+    already handled email again)."""
     discarded = {e["key"] for e in db.list_emails(db.DISCARDED)}
     return [k for k in keys if k in discarded]
 
 
 def discarded_status_text(message=""):
-    """已丢弃页状态文字：已丢弃总数、列表显示的数量 + 上一次操作的结果。"""
+    """Discarded tab status text: total discarded, number shown in the list + the result of the last action."""
     total = sum(c[db.DISCARDED] for c in db.count_by_status().values())
-    text = f"**已丢弃**：共 {total} 封，下面列出最近丢弃的 {min(total, DISCARDED_LIMIT)} 封"
+    text = (f"**Discarded**: {total} in total; the {min(total, DISCARDED_LIMIT)} most recently "
+            f"discarded are listed below")
     return text + "\n\n" + message if message else text
 
 
-# ---------------------------------------------------------------- 刷新
+# ---------------------------------------------------------------- refresh
 
 def refresh_discarded(message=""):
-    """重新生成已丢弃页，返回值顺序与 build_discarded_tab 里的 outputs 一致：
+    """Rebuild the Discarded tab; the return order matches outputs in build_discarded_tab:
 
-    (已丢弃列表, 状态文字)
-    列表按丢弃时间倒序，最多 DISCARDED_LIMIT 封，勾选清空。
+    (discarded list, status text)
+    The list is sorted by discard time, newest first, at most DISCARDED_LIMIT emails, with ticks cleared.
     """
     emails = db.list_emails(db.DISCARDED, limit=DISCARDED_LIMIT)
     choices = [(discarded_label(e), e["key"]) for e in emails]
@@ -656,14 +679,14 @@ def refresh_discarded(message=""):
 
 
 def discarded_error_outputs(err):
-    """出错时：只在状态文字里显示错误，列表保持不变。"""
-    return gr.skip(), f"**出错**：{md_escape(describe_error(err))}"
+    """On error: show the error only in the status text and leave the list unchanged."""
+    return gr.skip(), f"**Error**: {md_escape(describe_error(err))}"
 
 
-# ---------------------------------------------------------------- 已丢弃页事件
+# ---------------------------------------------------------------- Discarded tab events
 
 def on_discarded_refresh():
-    """打开页面、分拣页丢弃之后刷新。"""
+    """Refresh when the page opens or after discarding on the Triage tab."""
     try:
         return refresh_discarded()
     except Exception as e:
@@ -671,63 +694,65 @@ def on_discarded_refresh():
 
 
 def on_restore(selected):
-    """把勾选的已丢弃邮件恢复到待审。"""
+    """Restore the ticked discarded emails to review."""
     try:
         if not selected:
-            return gr.skip(), discarded_status_text("没有勾选任何邮件，未做任何操作。")
+            return gr.skip(), discarded_status_text("No emails are ticked; nothing was done.")
         changed = db.set_status(only_discarded(selected), db.REVIEW)
-        return refresh_discarded(f"已恢复到待审 {changed} 封。")
+        return refresh_discarded(f"Restored {changed} emails to review.")
     except Exception as e:
         return discarded_error_outputs(e)
 
 
-# ---------------------------------------------------------------- 界面
+# ---------------------------------------------------------------- UI
 
 def build_todo_tab(demo):
-    """在当前位置搭建"待办"标签页的内容并绑定事件。
+    """Build the contents of the "To-dos" tab in place and bind its events.
 
-    返回 {"delete": "确认删除"的事件, "refresh": 刷新本页的事件参数（fn / inputs / outputs）}，
-    供 build_app 在删除之后刷新已丢弃页、在分拣页"加入待办"之后刷新本页。
+    Returns {"delete": the "Confirm delete" event, "refresh": the event arguments that refresh this
+    tab (fn / inputs / outputs)}, so build_app can refresh the Discarded tab after a deletion and
+    refresh this tab after "Add to to-dos" on the Triage tab.
     """
     with gr.Row():
-        account_dd = gr.Dropdown([ALL] + account_aliases(), value=ALL, label="账号")
-        sort_radio = gr.Radio(SORT_CHOICES, value=db.SORT_DEADLINE, label="排序")
+        account_dd = gr.Dropdown([ALL] + account_aliases(), value=ALL, label="Account")
+        sort_radio = gr.Radio(SORT_CHOICES, value=db.SORT_DEADLINE, label="Sort")
 
-    pending_ids = gr.State(None)                        # "删除"等待确认的 id 列表
+    pending_ids = gr.State(None)                        # ids waiting for "Delete" to be confirmed
 
     with gr.Row():
-        # 左栏：未完成待办列表、批量操作、编辑区
+        # Left column: open to-do list, bulk actions, editor
         with gr.Column(scale=3):
-            open_list = gr.CheckboxGroup(label="未完成待办", show_label=True, show_select_all=True)
+            open_list = gr.CheckboxGroup(label="Open to-dos", show_label=True, show_select_all=True)
             with gr.Row():
-                done_btn = gr.Button("标记完成", variant="primary")
-                delete_btn = gr.Button("删除", variant="stop")
+                done_btn = gr.Button("Mark done", variant="primary")
+                delete_btn = gr.Button("Delete", variant="stop")
             with gr.Row(visible=False) as confirm_row:
                 confirm_md = gr.Markdown()
-                confirm_btn = gr.Button("确认删除", variant="stop", scale=0, min_width=120)
-                cancel_btn = gr.Button("取消", scale=0, min_width=120)
+                confirm_btn = gr.Button("Confirm delete", variant="stop", scale=0, min_width=120)
+                cancel_btn = gr.Button("Cancel", scale=0, min_width=120)
 
             with gr.Group():
-                edit_dd = gr.Dropdown(label="编辑待办（当前未完成）", choices=[], value=None)
+                edit_dd = gr.Dropdown(label="Edit a to-do (open ones)", choices=[], value=None)
                 with gr.Row():
-                    title_tb = gr.Textbox(label="标题", scale=3)
-                    deadline_tb = gr.Textbox(label="截止日期", placeholder="YYYY-MM-DD，留空表示无",
+                    title_tb = gr.Textbox(label="Title", scale=3)
+                    deadline_tb = gr.Textbox(label="Deadline", placeholder="YYYY-MM-DD, empty for none",
                                              scale=2)
-                note_tb = gr.Textbox(label="备注", lines=2)
-            save_btn = gr.Button("保存")
+                note_tb = gr.Textbox(label="Note", lines=2)
+            save_btn = gr.Button("Save")
 
-        # 右栏：提醒（数量、操作结果）、来源邮件、已完成
+        # Right column: reminders (counts, action results), source email, done items
         with gr.Column(scale=2):
             status_md = gr.Markdown()
-            source_md = gr.Markdown("选择一条待办进行编辑。")
-            with gr.Accordion("已完成", open=False):
-                done_list = gr.CheckboxGroup(label=f"最近完成的 {DONE_LIMIT} 条", show_label=True)
-                undo_btn = gr.Button("撤销完成")
+            source_md = gr.Markdown("Select a to-do to edit.")
+            with gr.Accordion("Done", open=False):
+                done_list = gr.CheckboxGroup(label=f"The {DONE_LIMIT} most recently completed",
+                                             show_label=True)
+                undo_btn = gr.Button("Undo done")
 
-    # 刷新类事件的输出，顺序与 refresh_todo() 的返回值一致
+    # Outputs of refresh-type events, in the same order as refresh_todo()'s return value
     outputs = [open_list, edit_dd, title_tb, deadline_tb, note_tb, source_md,
                done_list, confirm_row, pending_ids, status_md]
-    view = [account_dd, sort_radio, edit_dd]          # 刷新需要的输入：筛选、排序、当前编辑的待办
+    view = [account_dd, sort_radio, edit_dd]          # Inputs needed to refresh: filter, sort, to-do being edited
 
     demo.load(on_todo_refresh, inputs=view, outputs=outputs)
     account_dd.change(on_todo_refresh, inputs=view, outputs=outputs)
@@ -740,7 +765,7 @@ def build_todo_tab(demo):
                                      outputs=outputs)
     cancel_btn.click(on_cancel_delete, inputs=None, outputs=[confirm_row, pending_ids])
 
-    # 只响应用户手动选择；刷新时 refresh_todo() 已经处理了编辑区
+    # Respond only to manual selection; on refresh, refresh_todo() already handles the editor
     edit_dd.input(on_select_todo, inputs=edit_dd,
                   outputs=[title_tb, deadline_tb, note_tb, source_md])
     save_btn.click(on_save_todo,
@@ -753,17 +778,18 @@ def build_todo_tab(demo):
 
 
 def build_discarded_tab(demo):
-    """在当前位置搭建"已丢弃"标签页的内容并绑定事件。
+    """Build the contents of the "Discarded" tab in place and bind its events.
 
-    返回 {"restore": "恢复到待审"按钮的事件, "refresh": 刷新本页的事件参数（fn / inputs / outputs）}，
-    供 build_app 在恢复之后刷新分拣页、在分拣页丢弃之后刷新本页。
+    Returns {"restore": the "Restore to review" button event, "refresh": the event arguments that
+    refresh this tab (fn / inputs / outputs)}, so build_app can refresh the Triage tab after a
+    restore and refresh this tab after discarding on the Triage tab.
     """
     status_md = gr.Markdown()
-    discarded_list = gr.CheckboxGroup(label=f"最近丢弃的 {DISCARDED_LIMIT} 封", show_label=True,
-                                      show_select_all=True)
-    restore_btn = gr.Button("恢复到待审", variant="primary")
+    discarded_list = gr.CheckboxGroup(label=f"The {DISCARDED_LIMIT} most recently discarded",
+                                      show_label=True, show_select_all=True)
+    restore_btn = gr.Button("Restore to review", variant="primary")
 
-    # 刷新类事件的输出，顺序与 refresh_discarded() 的返回值一致
+    # Outputs of refresh-type events, in the same order as refresh_discarded()'s return value
     outputs = [discarded_list, status_md]
 
     demo.load(on_discarded_refresh, inputs=None, outputs=outputs)
@@ -774,35 +800,36 @@ def build_discarded_tab(demo):
 
 
 def build_sort_tab(demo):
-    """在当前位置搭建"分拣"标签页的内容并绑定事件。
+    """Build the contents of the "Triage" tab in place and bind its events.
 
-    返回 {"add": "加入待办"的事件, "discards": ["丢弃选中"、"确认丢弃"的事件],
-          "refresh": 刷新本页的事件参数（fn / inputs / outputs）}，
-    供 build_app 用 .then 刷新待办页、已丢弃页，以及在已丢弃页恢复之后刷新本页。
+    Returns {"add": the "Add to to-dos" event, "discards": ["Discard ticked" and "Confirm discard" events],
+             "refresh": the event arguments that refresh this tab (fn / inputs / outputs)},
+    so build_app can use .then to refresh the To-dos and Discarded tabs, and refresh this tab
+    after a restore on the Discarded tab.
     """
     with gr.Row():
-        pull_btn = gr.Button("拉取并分析", variant="primary", scale=0, min_width=160)
+        pull_btn = gr.Button("Fetch and analyze", variant="primary", scale=0, min_width=160)
         status_md = gr.Markdown()
     with gr.Row():
-        account_dd = gr.Dropdown([ALL] + account_aliases(), value=ALL, label="账号")
-        priority_dd = gr.Dropdown(PRIORITY_CHOICES, value=ALL, label="优先级")
+        account_dd = gr.Dropdown([ALL] + account_aliases(), value=ALL, label="Account")
+        priority_dd = gr.Dropdown(PRIORITY_CHOICES, value=ALL, label="Priority")
 
-    mail_list = gr.CheckboxGroup(label="待审邮件", show_label=True, show_select_all=True)
+    mail_list = gr.CheckboxGroup(label="Emails to review", show_label=True, show_select_all=True)
     with gr.Row():
-        add_btn = gr.Button("加入待办", variant="primary")
-        discard_btn = gr.Button("丢弃选中")
-        discard_rest_btn = gr.Button("其余全部丢弃", variant="stop")
+        add_btn = gr.Button("Add to to-dos", variant="primary")
+        discard_btn = gr.Button("Discard ticked")
+        discard_rest_btn = gr.Button("Discard all the rest", variant="stop")
 
     with gr.Row(visible=False) as confirm_row:
         confirm_md = gr.Markdown()
-        confirm_btn = gr.Button("确认丢弃", variant="stop", scale=0, min_width=120)
-        cancel_btn = gr.Button("取消", scale=0, min_width=120)
-    pending_keys = gr.State(None)                       # "其余全部丢弃"等待确认的 key 列表
+        confirm_btn = gr.Button("Confirm discard", variant="stop", scale=0, min_width=120)
+        cancel_btn = gr.Button("Cancel", scale=0, min_width=120)
+    pending_keys = gr.State(None)                       # Keys waiting for "Discard all the rest" to be confirmed
 
-    detail_dd = gr.Dropdown(label="查看详情（当前待审邮件）", choices=[], value=None)
-    detail_md = gr.Markdown("选择一封邮件查看详情。")
+    detail_dd = gr.Dropdown(label="View details (emails to review)", choices=[], value=None)
+    detail_md = gr.Markdown("Select an email to view its details.")
 
-    # 刷新类事件的输出，顺序与 refresh() 的返回值一致
+    # Outputs of refresh-type events, in the same order as refresh()'s return value
     outputs = [mail_list, status_md, detail_dd, detail_md, confirm_row, pending_keys]
     filters = [account_dd, priority_dd]
 
@@ -823,7 +850,7 @@ def build_sort_tab(demo):
                                       outputs=outputs)
     cancel_btn.click(on_cancel_discard_rest, inputs=None, outputs=[confirm_row, pending_keys])
 
-    # 只响应用户手动选择；刷新时 refresh() 已经直接更新了详情
+    # Respond only to manual selection; on refresh, refresh() already updates the details directly
     detail_dd.input(on_select_detail, inputs=detail_dd, outputs=detail_md)
 
     return {"add": add_event,
@@ -832,27 +859,29 @@ def build_sort_tab(demo):
 
 
 def build_app():
-    """搭建整个界面：分拣、待办、已丢弃三个标签页。"""
-    with gr.Blocks(title="邮件分拣") as demo:
+    """Build the whole UI: the Triage, To-dos and Discarded tabs."""
+    with gr.Blocks(title="Mail Triage") as demo:
         with gr.Tabs():
-            with gr.Tab("分拣"):
+            with gr.Tab("Triage"):
                 sort_tab = build_sort_tab(demo)
-            with gr.Tab("待办"):
+            with gr.Tab("To-dos"):
                 todo_tab = build_todo_tab(demo)
-            with gr.Tab("已丢弃"):
+            with gr.Tab("Discarded"):
                 discarded_tab = build_discarded_tab(demo)
-        # 以下刷新都在前一个事件完成后（无论成败）进行，切到对应标签页立即可见
-        sort_tab["add"].then(**todo_tab["refresh"])            # 加入待办 → 刷新待办页
-        for event in sort_tab["discards"]:                     # 丢弃选中 / 确认丢弃 → 刷新已丢弃页
+        # Each refresh below runs after the previous event finishes (whether or not it succeeded),
+        # so switching to that tab shows the result right away
+        sort_tab["add"].then(**todo_tab["refresh"])            # Add to to-dos → refresh the To-dos tab
+        for event in sort_tab["discards"]:                     # Discard ticked / confirm discard → refresh the Discarded tab
             event.then(**discarded_tab["refresh"])
-        todo_tab["delete"].then(**discarded_tab["refresh"])    # 删除待办 → 刷新已丢弃页
-        discarded_tab["restore"].then(**sort_tab["refresh"])   # 恢复到待审 → 刷新分拣页
+        todo_tab["delete"].then(**discarded_tab["refresh"])    # Delete to-dos → refresh the Discarded tab
+        discarded_tab["restore"].then(**sort_tab["refresh"])   # Restore to review → refresh the Triage tab
     return demo
 
 
 def main():
     db.init_db()
-    # 只监听本机；share=False 显式写出，防止环境变量 GRADIO_SHARE=True 时生成公网链接
+    # Listen on this machine only; share=False is written out explicitly so GRADIO_SHARE=True
+    # in the environment cannot create a public link
     build_app().launch(server_name="127.0.0.1", share=False)
 
 

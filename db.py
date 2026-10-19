@@ -1,14 +1,17 @@
-"""数据库层：所有对 mail.db 的读写都集中在这里，其他文件只调用这里的函数，不直接写 SQL。
+"""Database layer: every read and write to mail.db lives here. Other files only call these
+functions and never write SQL themselves.
 
-三张表：
-    emails    邮件本身和它的状态（new → review → todo / discarded）
-    analyses  AI 分析结果，一封邮件最多一条（分析失败时 error 字段记录原因）
-    todos     待办事项；"已完成"记在这里的 done 字段，不是邮件状态
+Three tables:
+    emails    The emails and their status (new → review → todo / discarded)
+    analyses  AI analysis results, at most one per email (the error field records why an analysis failed)
+    todos     To-do items; "done" is stored in this table's done field, not as an email status
 
-使用注意：
-    - 每个函数内部新开连接、用完关闭。Gradio 会在不同线程调用，sqlite3 默认禁止跨线程共用同一连接。
-    - 所有变量都用 ? 占位符传入，不拼接到 SQL 里。
-    - 数据库路径是模块变量 DB_PATH，测试时可以改成临时文件：db.DB_PATH = "某个路径.db"
+Notes:
+    - Every function opens a new connection and closes it when finished. Gradio calls these from
+      different threads, and sqlite3 forbids sharing one connection across threads by default.
+    - All variables are passed in with ? placeholders and never concatenated into the SQL.
+    - The database path is the module variable DB_PATH; tests can point it at a temporary file:
+      db.DB_PATH = "some_path.db"
 """
 
 import json
@@ -17,23 +20,23 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
-# ---------------------------------------------------------------- 常量
+# ---------------------------------------------------------------- constants
 
-# 邮件状态
-NEW = "new"                # 刚拉取，还没分析
-REVIEW = "review"          # 已分析，等我决定
-TODO = "todo"              # 已加入待办
-DISCARDED = "discarded"    # 已丢弃（可恢复为 review）
+# Email statuses
+NEW = "new"                # Just fetched, not analyzed yet
+REVIEW = "review"          # Analyzed, waiting for my decision
+TODO = "todo"              # Added to the to-do list
+DISCARDED = "discarded"    # Discarded (can be restored to review)
 ALL_STATUSES = (NEW, REVIEW, TODO, DISCARDED)
 
-# 待办排序方式
+# To-do sort orders
 SORT_DEADLINE = "deadline"
 SORT_PRIORITY = "priority"
 
-# 默认数据库文件：与 db.py 同目录的 mail.db
+# Default database file: mail.db in the same folder as db.py
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mail.db")
 
-# 两张表的列名，用来把联表查询的结果拆成"邮件"和"分析"两部分
+# Column names of the two tables, used to split a joined row into its "email" and "analysis" parts
 EMAIL_COLUMNS = ("key", "account", "msg_id", "thread_id", "internal_ms", "received_at",
                  "sender", "to_addr", "cc_addr", "subject", "labels", "attachments",
                  "snippet", "body", "status", "status_changed_at", "fetched_at")
@@ -43,18 +46,18 @@ ANALYSIS_COLUMNS = ("email_key", "category", "priority", "needs_action", "action
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS emails (
-    key               TEXT PRIMARY KEY,      -- "别名:Gmail邮件ID"
-    account           TEXT NOT NULL,         -- 账号别名
-    msg_id            TEXT NOT NULL,         -- Gmail 邮件 ID
+    key               TEXT PRIMARY KEY,      -- "alias:Gmail message ID"
+    account           TEXT NOT NULL,         -- account alias
+    msg_id            TEXT NOT NULL,         -- Gmail message ID
     thread_id         TEXT,
-    internal_ms       INTEGER,               -- Gmail 内部接收时间（毫秒时间戳）
-    received_at       TEXT,                  -- 接收时间（本地时间，ISO 格式）
+    internal_ms       INTEGER,               -- Gmail internal receive time (millisecond timestamp)
+    received_at       TEXT,                  -- receive time (local time, ISO format)
     sender            TEXT,
     to_addr           TEXT,
     cc_addr           TEXT,
     subject           TEXT,
-    labels            TEXT,                  -- JSON 文本（列表）
-    attachments       TEXT,                  -- JSON 文本（附件文件名列表）
+    labels            TEXT,                  -- JSON text (list)
+    attachments       TEXT,                  -- JSON text (list of attachment file names)
     snippet           TEXT,
     body              TEXT,
     status            TEXT NOT NULL,
@@ -68,13 +71,13 @@ CREATE TABLE IF NOT EXISTS analyses (
     priority       INTEGER CHECK (priority BETWEEN 1 AND 4),
     needs_action   INTEGER CHECK (needs_action IN (0, 1)),
     action         TEXT,
-    deadline       TEXT,                     -- YYYY-MM-DD 或 NULL
+    deadline       TEXT,                     -- YYYY-MM-DD or NULL
     summary        TEXT,
     reason         TEXT,
     suspicious     INTEGER CHECK (suspicious IN (0, 1)),
     model          TEXT,
     prompt_version TEXT,
-    error          TEXT,                     -- 失败原因；成功为 NULL
+    error          TEXT,                     -- failure reason; NULL on success
     analyzed_at    TEXT
 );
 
@@ -83,7 +86,7 @@ CREATE TABLE IF NOT EXISTS todos (
     email_key  TEXT REFERENCES emails(key),
     account    TEXT,
     title      TEXT NOT NULL,
-    deadline   TEXT,                         -- YYYY-MM-DD 或 NULL
+    deadline   TEXT,                         -- YYYY-MM-DD or NULL
     priority   INTEGER CHECK (priority BETWEEN 1 AND 4),
     note       TEXT,
     done       INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0, 1)),
@@ -96,36 +99,38 @@ CREATE INDEX IF NOT EXISTS idx_emails_account ON emails(account);
 CREATE INDEX IF NOT EXISTS idx_todos_done     ON todos(done);
 """
 
-# 联表查询：邮件 + 分析（LEFT JOIN，没有分析的邮件也会返回）
+# Joined query: email + analysis (LEFT JOIN, so emails without an analysis are returned too)
 _SELECT_EMAIL = "SELECT e.*, a.* FROM emails AS e LEFT JOIN analyses AS a ON a.email_key = e.key"
 
-# list_emails 的排序（固定的 SQL 片段）
+# Sort orders for list_emails (fixed SQL fragments)
 _EMAIL_ORDER = {
-    # 无优先级（分析失败）的排最前，提醒人工看；再按优先级升序、接收时间倒序
+    # Emails without a priority (failed analysis) first, as a reminder to check them by hand;
+    # then by priority ascending, then by receive time descending
     REVIEW: "a.priority IS NOT NULL, a.priority ASC, e.internal_ms DESC",
-    # 最近丢弃的排最前
+    # Most recently discarded first
     DISCARDED: "e.status_changed_at DESC, e.internal_ms DESC",
 }
 _EMAIL_ORDER_DEFAULT = "e.internal_ms DESC"
 
-# list_todos 的排序（固定的 SQL 片段）；没有截止日期/优先级的放最后
+# Sort orders for list_todos (fixed SQL fragments); items without a deadline/priority go last
 _TODO_ORDER = {
     SORT_DEADLINE: "deadline IS NULL, deadline ASC, priority IS NULL, priority ASC, id ASC",
     SORT_PRIORITY: "priority IS NULL, priority ASC, deadline IS NULL, deadline ASC, id ASC",
 }
 
 
-# ---------------------------------------------------------------- 内部工具
+# ---------------------------------------------------------------- internal helpers
 
 @contextmanager
 def _connect():
-    """打开一个新连接，离开 with 时关闭。
+    """Open a new connection and close it when the with block exits.
 
-    用法：with _connect() as conn, conn:
-        第一个 with 负责关闭连接；第二个 "with conn" 负责事务（正常结束自动提交，出错自动回滚）。
-        只读查询可以只写 with _connect() as conn:
+    Usage: with _connect() as conn, conn:
+        The first with closes the connection; the second "with conn" handles the transaction
+        (commits on normal exit, rolls back on error). Read-only queries can use just
+        with _connect() as conn:
     """
-    conn = sqlite3.connect(DB_PATH)   # 运行时读取 DB_PATH，测试改路径后立即生效
+    conn = sqlite3.connect(DB_PATH)   # Read DB_PATH at call time, so a path changed by tests takes effect
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
@@ -135,41 +140,42 @@ def _connect():
 
 
 def _now():
-    """当前本地时间，ISO 格式，精确到秒。"""
+    """Current local time in ISO format, to the second."""
     return datetime.now().isoformat(timespec="seconds")
 
 
 def _check_status(status):
-    """状态必须是四个常量之一。"""
+    """The status must be one of the four constants."""
     if status not in ALL_STATUSES:
-        raise ValueError(f"未知的邮件状态：{status!r}")
+        raise ValueError(f"Unknown email status: {status!r}")
 
 
 def _check_date(value):
-    """日期必须是 YYYY-MM-DD 或空；空字符串统一转成 None。返回规范后的值。"""
+    """The date must be YYYY-MM-DD or empty; an empty string becomes None. Returns the normalized value."""
     if value in (None, ""):
         return None
-    datetime.strptime(value, "%Y-%m-%d")   # 格式不对会抛 ValueError
+    datetime.strptime(value, "%Y-%m-%d")   # Raises ValueError if the format is wrong
     return value
 
 
 def _to_flag(value):
-    """把 True/False 转成 1/0；None 保持 None（分析失败时没有这个值）。"""
+    """Convert True/False to 1/0; None stays None (a failed analysis has no value)."""
     return None if value is None else int(bool(value))
 
 
 def _to_int(value):
-    """转成整数；None 保持 None。"""
+    """Convert to an integer; None stays None."""
     return None if value is None else int(value)
 
 
 def _unique(items):
-    """去重并保持原顺序，返回列表。"""
+    """Remove duplicates while keeping the original order; returns a list."""
     return list(dict.fromkeys(items))
 
 
 def _row_to_email(row):
-    """把联表查询的一行转成普通 dict；分析结果放在 "analysis" 键下，没有分析则为 None。"""
+    """Turn one row of the joined query into a plain dict; the analysis goes under the "analysis"
+    key, or None if there is no analysis."""
     email = {col: row[col] for col in EMAIL_COLUMNS}
     email["labels"] = json.loads(email["labels"] or "[]")
     email["attachments"] = json.loads(email["attachments"] or "[]")
@@ -179,32 +185,32 @@ def _row_to_email(row):
 
 
 def _todo_title(row):
-    """待办标题：默认用分析里的 action；action 为空时用邮件主题。"""
+    """To-do title: the analysis action by default; the email subject when the action is empty."""
     action = (row["action"] or "").strip()
     return action or (row["subject"] or "")
 
 
-# ---------------------------------------------------------------- 初始化
+# ---------------------------------------------------------------- initialization
 
 def init_db():
-    """建表、建索引。重复运行不会出错，也不会清空已有数据。"""
+    """Create the tables and indexes. Safe to run repeatedly; never clears existing data."""
     with _connect() as conn, conn:
         conn.executescript(_SCHEMA)
 
 
-# ---------------------------------------------------------------- 邮件
+# ---------------------------------------------------------------- emails
 
 def email_exists(key):
-    """这封邮件是否已经在库里。"""
+    """Whether this email is already in the database."""
     with _connect() as conn:
         row = conn.execute("SELECT 1 FROM emails WHERE key = ?", (key,)).fetchone()
     return row is not None
 
 
 def insert_email(record):
-    """保存一封邮件（record 为 fetch_mail.fetch_one() 返回的字典）。
+    """Save one email (record is the dict returned by fetch_mail.fetch_one()).
 
-    已存在就忽略；新邮件状态为 new。返回是否新增。
+    Ignored if it already exists; a new email gets status new. Returns whether a row was added.
     """
     now = _now()
     values = (
@@ -228,7 +234,7 @@ def insert_email(record):
 
 
 def latest_internal_ms(account):
-    """该账号库里最新一封邮件的 internal_ms；没有邮件时返回 None。"""
+    """internal_ms of this account's newest email in the database; None if it has no emails."""
     with _connect() as conn:
         row = conn.execute("SELECT MAX(internal_ms) AS m FROM emails WHERE account = ?",
                            (account,)).fetchone()
@@ -236,16 +242,16 @@ def latest_internal_ms(account):
 
 
 def list_emails(status, account=None, priority=None, limit=None):
-    """列出某个状态的邮件，返回 dict 列表，每封带 "analysis"（没有分析时为 None）。
+    """List emails with the given status as a list of dicts, each with "analysis" (None if not analyzed).
 
-    排序：
-        review     无优先级（分析失败）的排最前，再按优先级升序、接收时间倒序
-        discarded  按丢弃时间（status_changed_at）倒序
-        其他       按接收时间倒序
-    account / priority / limit 为 None 表示不筛选、不限制数量。
+    Sort order:
+        review     no priority (failed analysis) first, then priority ascending, receive time descending
+        discarded  discard time (status_changed_at) descending
+        others     receive time descending
+    account / priority / limit of None mean no filter and no limit.
     """
     _check_status(status)
-    # 只拼接上面定义好的固定 SQL 片段；所有变量都放进 params，用 ? 传入
+    # Only the fixed SQL fragments defined above are concatenated; every variable goes into params via ?
     sql = _SELECT_EMAIL + " WHERE e.status = ?"
     params = [status]
     if account is not None:
@@ -265,14 +271,15 @@ def list_emails(status, account=None, priority=None, limit=None):
 
 
 def get_email(key):
-    """返回一封邮件及其分析（"analysis" 键）；邮件不存在时返回 None。"""
+    """Return one email with its analysis (the "analysis" key); None if the email does not exist."""
     with _connect() as conn:
         row = conn.execute(_SELECT_EMAIL + " WHERE e.key = ?", (key,)).fetchone()
     return _row_to_email(row) if row else None
 
 
 def set_status(keys, status):
-    """批量修改邮件状态并更新 status_changed_at。返回实际改了几封（本来就是该状态的不算）。"""
+    """Change the status of several emails and update status_changed_at. Returns how many actually
+    changed (emails already in that status are not counted)."""
     _check_status(status)
     keys = _unique(keys)
     if not keys:
@@ -287,9 +294,10 @@ def set_status(keys, status):
 
 
 def reset_to_new(keys):
-    """把邮件改回 new 并删除对应的分析（改完提示词后重跑评估用）。返回改了几封。
+    """Set emails back to new and delete their analyses (used to re-run the evaluation after
+    changing the prompt). Returns how many changed.
 
-    注意：只动邮件和分析，已经建好的待办不会删除。
+    Note: only emails and analyses are touched; existing to-dos are not deleted.
     """
     keys = _unique(keys)
     if not keys:
@@ -304,15 +312,15 @@ def reset_to_new(keys):
         return cur.rowcount
 
 
-# ---------------------------------------------------------------- 分析
+# ---------------------------------------------------------------- analyses
 
 def save_analysis(key, result, model, prompt_version, error=None):
-    """写入或覆盖一封邮件的分析，并把邮件状态改为 review（同一事务）。
+    """Write or overwrite an email's analysis and set the email status to review (one transaction).
 
-    result 是分析结果字典，键为 category、priority、needs_action、action、deadline、
-    summary、reason、suspicious；分析失败时可传 None，并在 error 里写失败原因。
-    邮件不存在时抛 KeyError；priority 不在 1–4 时抛 sqlite3.IntegrityError；
-    deadline 不是 YYYY-MM-DD 时抛 ValueError。出错时整个操作回滚。
+    result is the analysis dict with keys category, priority, needs_action, action, deadline,
+    summary, reason, suspicious; pass None when the analysis failed and put the reason in error.
+    Raises KeyError if the email does not exist, sqlite3.IntegrityError if priority is not 1–4,
+    and ValueError if deadline is not YYYY-MM-DD. On any error the whole operation is rolled back.
     """
     result = result or {}
     values = (
@@ -334,7 +342,7 @@ def save_analysis(key, result, model, prompt_version, error=None):
         cur = conn.execute("UPDATE emails SET status = ?, status_changed_at = ? WHERE key = ?",
                            (REVIEW, _now(), key))
         if cur.rowcount == 0:
-            raise KeyError(f"邮件不存在：{key}")
+            raise KeyError(f"Email does not exist: {key}")
         conn.execute(
             "INSERT OR REPLACE INTO analyses (email_key, category, priority, needs_action, "
             "action, deadline, summary, reason, suspicious, model, prompt_version, error, "
@@ -343,20 +351,23 @@ def save_analysis(key, result, model, prompt_version, error=None):
         )
 
 
-# ---------------------------------------------------------------- 待办
+# ---------------------------------------------------------------- to-dos
 
 def add_todos(keys):
-    """对每封邮件用分析结果新建待办，并把邮件状态改为 todo（同一事务）。返回新建了几条。
+    """Create a to-do from each email's analysis and set the email status to todo (one transaction).
+    Returns how many were created.
 
-    标题默认用 action，action 为空时用邮件主题；截止日期、优先级从分析复制。
-    已经是 todo 的邮件、不存在的邮件会跳过，不重复建。
+    The title defaults to the action, or the email subject when the action is empty; deadline and
+    priority are copied from the analysis. Emails already in todo, or that do not exist, are
+    skipped, so no duplicates are created.
     """
     keys = _unique(keys)
     now = _now()
     created = 0
     with _connect() as conn, conn:
         for key in keys:
-            # 先改状态：已经是 todo 或邮件不存在时改不动（rowcount 为 0），直接跳过
+            # Change the status first: if the email is already todo or does not exist,
+            # nothing changes (rowcount is 0) and we skip it
             cur = conn.execute(
                 "UPDATE emails SET status = ?, status_changed_at = ? WHERE key = ? AND status != ?",
                 (TODO, now, key, TODO),
@@ -380,14 +391,15 @@ def add_todos(keys):
 
 
 def list_todos(done=False, account=None, sort=SORT_DEADLINE, limit=None):
-    """列出待办，返回 dict 列表。
+    """List to-dos as a list of dicts.
 
-    done：False 看未完成，True 看已完成。
-    sort："deadline" 按截止日期升序（无截止日期的放最后），"priority" 按优先级升序（无优先级的放最后）。
+    done: False for open items, True for completed ones.
+    sort: "deadline" sorts by deadline ascending (items without a deadline last); "priority" sorts
+    by priority ascending (items without a priority last).
     """
     if sort not in _TODO_ORDER:
-        raise ValueError(f"未知的排序方式：{sort!r}")
-    # 只拼接固定的 SQL 片段；变量都用 ? 传入
+        raise ValueError(f"Unknown sort order: {sort!r}")
+    # Only fixed SQL fragments are concatenated; variables are passed with ?
     sql = "SELECT * FROM todos WHERE done = ?"
     params = [int(bool(done))]
     if account is not None:
@@ -404,14 +416,14 @@ def list_todos(done=False, account=None, sort=SORT_DEADLINE, limit=None):
 
 
 def get_todo(todo_id):
-    """返回一条待办；不存在时返回 None。"""
+    """Return one to-do; None if it does not exist."""
     with _connect() as conn:
         row = conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,)).fetchone()
     return dict(row) if row else None
 
 
 def update_todo(todo_id, title, deadline, note):
-    """修改待办的标题、截止日期（YYYY-MM-DD 或空）、备注。返回是否改到了。"""
+    """Change a to-do's title, deadline (YYYY-MM-DD or empty) and note. Returns whether it was found."""
     deadline = _check_date(deadline)
     with _connect() as conn, conn:
         cur = conn.execute("UPDATE todos SET title = ?, deadline = ?, note = ? WHERE id = ?",
@@ -420,7 +432,8 @@ def update_todo(todo_id, title, deadline, note):
 
 
 def mark_done(ids):
-    """批量标记为已完成并记录完成时间。返回改了几条（本来已完成的不算）。"""
+    """Mark several to-dos as done and record the completion time. Returns how many changed
+    (items already done are not counted)."""
     ids = _unique(ids)
     if not ids:
         return 0
@@ -432,7 +445,7 @@ def mark_done(ids):
 
 
 def undo_done(ids):
-    """批量撤销完成（改回未完成，清空完成时间）。返回改了几条。"""
+    """Undo completion for several to-dos (back to open, completion time cleared). Returns how many changed."""
     ids = _unique(ids)
     if not ids:
         return 0
@@ -443,10 +456,12 @@ def undo_done(ids):
 
 
 def delete_todos(ids):
-    """批量删除待办，并把对应邮件从 todo 改为 discarded（同一事务）。返回删了几条。
+    """Delete several to-dos and move their emails from todo to discarded (one transaction).
+    Returns how many were deleted.
 
-    邮件进入"已丢弃"后可以恢复为 review，再次加入待办会新建一条。
-    待办没有来源邮件、或邮件已不是 todo 状态时，只删待办，不改邮件。
+    Once in "Discarded", an email can be restored to review; adding it to the to-do list again
+    creates a new to-do. If a to-do has no source email, or the email is no longer in todo,
+    only the to-do is deleted and the email is left alone.
     """
     ids = _unique(ids)
     if not ids:
@@ -456,7 +471,7 @@ def delete_todos(ids):
     with _connect() as conn, conn:
         for todo_id in ids:
             row = conn.execute("SELECT email_key FROM todos WHERE id = ?", (todo_id,)).fetchone()
-            if row is None:                      # 待办已不存在，跳过
+            if row is None:                      # The to-do no longer exists; skip it
                 continue
             conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
             deleted += 1
@@ -468,10 +483,11 @@ def delete_todos(ids):
     return deleted
 
 
-# ---------------------------------------------------------------- 统计
+# ---------------------------------------------------------------- statistics
 
 def count_by_status():
-    """每个账号每个状态的邮件数量，例如 {"work": {"new": 3, "review": 5, "todo": 1, "discarded": 0}}。"""
+    """Number of emails per account per status, e.g.
+    {"work": {"new": 3, "review": 5, "todo": 1, "discarded": 0}}."""
     with _connect() as conn:
         rows = conn.execute("SELECT account, status, COUNT(*) AS n FROM emails "
                             "GROUP BY account, status ORDER BY account").fetchall()

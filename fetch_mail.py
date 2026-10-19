@@ -1,16 +1,18 @@
-"""拉取邮件：从 accounts.json 里每个启用的账号拉取收件箱的新邮件，清洗后存进数据库 mail.db。
+"""Fetch mail: pull new inbox mail from every enabled account in accounts.json, clean it up and
+save it to the database mail.db.
 
-前提：已经用 authorize.py 为每个账号授权（tokens/别名.json 存在）。
+Prerequisite: every account has been authorized with authorize.py (tokens/<alias>.json exists).
 
-用法（在项目文件夹里运行）：
-    python fetch_mail.py               库里没有该账号的邮件时拉最近 2 天；之后只拉"库里最新一封之后"的
-    python fetch_mail.py --days 1      库里没有该账号的邮件时拉最近 1 天
-    python fetch_mail.py --max 50      每个账号最多处理 50 封（默认 200）
+Usage (run inside the project folder):
+    python fetch_mail.py               If the database has no mail for an account, fetch the last 2 days;
+                                       after that, only fetch mail newer than the newest one in the database
+    python fetch_mail.py --days 1      If the database has no mail for an account, fetch the last 1 day
+    python fetch_mail.py --max 50      Process at most 50 emails per account (default 200)
 
-其他程序（如网页界面）调用 fetch_all()，它返回汇总字典，不打印任何东西。
+Other programs (such as the web UI) call fetch_all(), which returns a summary dict and prints nothing.
 
-只拉收件箱"主要"（Primary）标签页的邮件，社交、推广、更新、论坛都不拉。
-这个程序只读邮件，不会修改、移动、删除或标记任何邮件。
+Only mail in the inbox's Primary tab is fetched; Social, Promotions, Updates and Forums are skipped.
+This program only reads mail. It never modifies, moves, deletes or labels any email.
 """
 
 import argparse
@@ -29,12 +31,12 @@ ACCOUNTS_FILE = "accounts.json"
 TOKENS_DIR = "tokens"
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
-OVERLAP_SECONDS = 3600     # 增量拉取时往前多倒退 1 小时，宁可多拉再去重，避免漏邮件
-MAX_BODY_CHARS = 4000      # 正文最多保留的字数
-MAX_ERROR_CHARS = 200      # 错误信息最多保留的字数（只放进汇总，不含令牌和正文）
+OVERLAP_SECONDS = 3600     # Go back an extra hour on incremental fetches; better to fetch extra and dedupe than to miss mail
+MAX_BODY_CHARS = 4000      # Maximum number of body characters kept
+MAX_ERROR_CHARS = 200      # Maximum characters of an error message (summary only; no tokens or body text)
 
 
-# ---------------------------------------------------------------- 文件读取
+# ---------------------------------------------------------------- file reading
 
 def load_json(path, default):
     if not os.path.exists(path):
@@ -44,17 +46,17 @@ def load_json(path, default):
 
 
 def load_accounts():
-    """读取 accounts.json，返回启用的账号列表（没写 enabled 的视为启用）。"""
+    """Read accounts.json and return the enabled accounts (accounts without "enabled" count as enabled)."""
     data = load_json(ACCOUNTS_FILE, {"accounts": []})
     return [a for a in data.get("accounts", []) if a.get("enabled", True)]
 
 
-# ---------------------------------------------------------------- 连接 Gmail
+# ---------------------------------------------------------------- connecting to Gmail
 
 def connect(account):
-    """读取该账号的令牌，连接 Gmail，并核对邮箱。
+    """Load the account's token, connect to Gmail and check the mailbox address.
 
-    返回 (service, None)；失败时返回 (None, 错误信息)。
+    Returns (service, None); on failure returns (None, error message).
     """
     from google.auth.exceptions import RefreshError
     from google.oauth2.credentials import Credentials
@@ -63,26 +65,27 @@ def connect(account):
     alias, expected = account["alias"], account["email"]
     path = os.path.join(TOKENS_DIR, f"{alias}.json")
     if not os.path.exists(path):
-        return None, f"{alias}：没有令牌，请先运行 python authorize.py {alias}"
+        return None, f"{alias}: no token; run python authorize.py {alias} first"
 
     creds = Credentials.from_authorized_user_file(path, SCOPES)
     service = build("gmail", "v1", credentials=creds)
     try:
-        # 访问令牌过期时，库会用刷新令牌自动换新
+        # When the access token has expired, the library swaps in a new one using the refresh token
         actual = service.users().getProfile(userId="me").execute()["emailAddress"]
     except RefreshError:
-        return None, (f"{alias}：授权已失效（测试状态下约 7 天过期），"
-                      f"请运行 python authorize.py {alias} 重新授权")
+        return None, (f"{alias}: authorization has expired (about 7 days in testing mode); "
+                      f"run python authorize.py {alias} to authorize again")
 
     if actual.lower() != expected.lower():
-        return None, f"{alias}：令牌属于 {actual}，与清单里的 {expected} 不一致，请重新授权"
+        return None, (f"{alias}: the token belongs to {actual}, not {expected} as listed; "
+                      f"please authorize again")
     return service, None
 
 
-# ---------------------------------------------------------------- 第一步：拿 ID 清单
+# ---------------------------------------------------------------- step 1: get the ID list
 
 def list_message_ids(service, query, limit):
-    """列出收件箱里符合条件的邮件 ID（从新到旧），自动翻页，最多 limit 封。"""
+    """List matching inbox message IDs (newest first), following pages, at most limit of them."""
     ids, page_token = [], None
     while len(ids) < limit:
         resp = service.users().messages().list(
@@ -99,10 +102,10 @@ def list_message_ids(service, query, limit):
     return ids[:limit]
 
 
-# ---------------------------------------------------------------- 第二步：读内容并清洗
+# ---------------------------------------------------------------- step 2: read and clean the content
 
 class _HTMLToText(HTMLParser):
-    """把 HTML 邮件转成纯文字：丢掉样式和脚本，块级标签换行。"""
+    """Turn an HTML email into plain text: drop styles and scripts, break lines at block tags."""
     BLOCK = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
              "table", "ul", "ol", "blockquote", "hr"}
 
@@ -133,42 +136,46 @@ def html_to_text(html):
     return "".join(parser.parts)
 
 
-# 出现这些行，说明下面是引用的历史邮件，截掉
+# A line matching one of these means everything below it is quoted earlier mail, so cut it off.
+# The Chinese text in the patterns is intentional: it matches headers that Gmail writes into
+# Chinese-language emails, so it must stay in Chinese.
 _QUOTE_HEADERS = [
-    re.compile(r"^On .+wrote:\s*$"),                        # 英文 Gmail
-    re.compile(r".*写道[:：]\s*$"),                          # 中文 Gmail
+    re.compile(r"^On .+wrote:\s*$"),                        # English Gmail
+    re.compile(r".*写道[:：]\s*$"),                          # Chinese Gmail ("... wrote:")
     re.compile(r"^-{2,}\s*(Original Message|原始邮件)\s*-{2,}", re.I),
 ]
-# 注意：不截断"转发的邮件"（Forwarded message），因为转发内容往往就是这封邮件的重点
+# Note: "Forwarded message" is not cut off, because the forwarded content is often the point of the email
 
 
 def clean_body(text):
-    """去掉引用的历史回复和签名档，合并空行，截断过长内容。只是经验规则，不保证完美。"""
+    """Remove quoted replies and signatures, collapse blank lines, truncate long content.
+    These are rules of thumb and not guaranteed to be perfect."""
     text = text.replace("\r\n", "\n").replace("\xa0", " ").replace("​", "")
     kept = []
     for line in text.split("\n"):
         stripped = line.strip()
         if stripped.startswith(">"):
-            continue                                        # 引用行
+            continue                                        # Quoted line
         if stripped == "--":
-            break                                           # 标准签名分隔符 "-- "
+            break                                           # Standard signature separator "-- "
         if any(p.match(stripped) for p in _QUOTE_HEADERS) and kept:
-            break                                           # 下面都是历史邮件
+            break                                           # Everything below is earlier mail
         kept.append(line.rstrip())
     text = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
     if len(text) > MAX_BODY_CHARS:
-        text = text[:MAX_BODY_CHARS] + "\n……（正文过长，已截断）"
+        text = text[:MAX_BODY_CHARS] + "\n... (body too long, truncated)"
     return text
 
 
 def extract_body(msg):
-    """优先取纯文本正文；没有就取 HTML 转文字。Python 的 email 库会自动处理编码和字符集。"""
+    """Prefer the plain-text body; fall back to HTML converted to text. Python's email library
+    handles encodings and character sets automatically."""
     part = msg.get_body(preferencelist=("plain", "html"))
     if part is None:
         return ""
     try:
         content = part.get_content()
-    except (LookupError, UnicodeDecodeError):              # 字符集声明错误时兜底
+    except (LookupError, UnicodeDecodeError):              # Fallback when the declared charset is wrong
         content = part.get_payload(decode=True).decode("utf-8", errors="replace")
     if part.get_content_type() == "text/html":
         content = html_to_text(content)
@@ -176,7 +183,7 @@ def extract_body(msg):
 
 
 def fetch_one(service, alias, msg_id):
-    """读取一封邮件，返回整理好的字典。"""
+    """Read one email and return it as a cleaned-up dict."""
     resp = service.users().messages().get(userId="me", id=msg_id, format="raw").execute()
     raw_bytes = base64.urlsafe_b64decode(resp["raw"])
     msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
@@ -184,7 +191,7 @@ def fetch_one(service, alias, msg_id):
     attachments = [p.get_filename() for p in msg.iter_attachments() if p.get_filename()]
     internal_ms = int(resp.get("internalDate", 0))
     return {
-        "key": f"{alias}:{msg_id}",           # 别名 + 邮件 ID 作为唯一标识
+        "key": f"{alias}:{msg_id}",           # Alias + message ID as the unique key
         "account": alias,
         "id": msg_id,
         "thread_id": resp.get("threadId"),
@@ -201,22 +208,24 @@ def fetch_one(service, alias, msg_id):
     }
 
 
-# ---------------------------------------------------------------- 主流程
+# ---------------------------------------------------------------- main flow
 
 def build_query(alias, days):
-    """库里有该账号的邮件就只拉最新一封之后的；否则拉最近 days 天。只拉"主要"标签页。"""
+    """If the database has mail for this account, only fetch mail after the newest one; otherwise
+    fetch the last days days. Only the Primary tab is fetched."""
     last_ms = db.latest_internal_ms(alias)
     if last_ms:
-        # 用秒数时间戳，避免 Gmail 把日期按太平洋时间零点解释
+        # Use a timestamp in seconds so Gmail does not interpret the date as midnight Pacific time
         return f"after:{last_ms // 1000 - OVERLAP_SECONDS} category:primary"
     return f"newer_than:{days}d category:primary"
 
 
 def list_new_ids(service, alias, days, limit):
-    """列出该账号符合条件的邮件 ID，跳过库里已有的。
+    """List this account's matching message IDs, skipping ones already in the database.
 
-    返回 (找到的总数, 新邮件 ID 列表)。新邮件按从旧到新排列：
-    这样中途中断时，库里"最新一封"不会跑到还没读的邮件前面，下次增量拉取不会漏掉它们。
+    Returns (total found, list of new message IDs). New IDs are ordered oldest to newest, so if
+    the run is interrupted, the database's "newest email" never jumps ahead of unread ones and
+    the next incremental fetch will not miss them.
     """
     ids = list_message_ids(service, build_query(alias, days), limit)
     new_ids = [i for i in ids if not db.email_exists(f"{alias}:{i}")]
@@ -225,19 +234,20 @@ def list_new_ids(service, alias, days, limit):
 
 
 def save_one(service, alias, msg_id):
-    """读取一封邮件并立即存库。返回是否真的新增了一条。"""
+    """Read one email and save it immediately. Returns whether a new row was actually added."""
     return db.insert_email(fetch_one(service, alias, msg_id))
 
 
 def describe_error(alias, err):
-    """把异常转成一行简短的错误信息（只含异常类型和简短说明）。"""
-    return f"{alias}：出错（{type(err).__name__}）：{str(err)[:MAX_ERROR_CHARS]}"
+    """Turn an exception into a short one-line message (exception type and a short description only)."""
+    return f"{alias}: error ({type(err).__name__}): {str(err)[:MAX_ERROR_CHARS]}"
 
 
 def prepare_account(account, days, max_per_account):
-    """连接一个账号并列出新邮件 ID。
+    """Connect to one account and list its new message IDs.
 
-    返回 (service, 找到的总数, 新邮件 ID 列表, 问题列表)；连接失败时 service 为 None。
+    Returns (service, total found, list of new message IDs, list of problems); service is None
+    if the connection failed.
     """
     alias = account["alias"]
     try:
@@ -245,37 +255,40 @@ def prepare_account(account, days, max_per_account):
         if service is None:
             return None, 0, [], [error]
         found, new_ids = list_new_ids(service, alias, days, max_per_account)
-    except Exception as e:                       # 网络、令牌文件损坏等，记下来继续处理其他账号
+    except Exception as e:                       # Network, corrupt token file, etc.: record it and move on to the other accounts
         return None, 0, [], [describe_error(alias, e)]
 
     problems = []
     if found >= max_per_account:
-        problems.append(f"{alias}：已达到单次上限 {max_per_account} 封，可能还有更早的邮件没拉")
+        problems.append(f"{alias}: reached the per-run limit of {max_per_account} emails; "
+                        f"older mail may not have been fetched")
     return service, found, new_ids, problems
 
 
 def fetch_all(days=2, max_per_account=200, progress=None):
-    """拉取所有启用账号的新邮件并存库，返回汇总：
+    """Fetch new mail for all enabled accounts, save it, and return a summary:
 
-        {"accounts": {别名: {"found": 找到, "new": 新增入库, "failed": 读取失败}},
-         "problems": ["work：授权已失效，……", ...]}
+        {"accounts": {alias: {"found": found, "new": newly saved, "failed": failed to read}},
+         "problems": ["work: authorization has expired, ...", ...]}
 
-    "accounts" 只包含成功连接并列出邮件的账号；连接失败的账号只出现在 "problems" 里。
-    progress 是可选回调 progress(fraction, message)，每处理完一封调用一次，
-    fraction 在 0–1 之间，覆盖所有账号。不抛异常中断，问题都记在 "problems" 里。
+    "accounts" only contains accounts that connected and listed mail successfully; accounts that
+    failed to connect only appear in "problems".
+    progress is an optional callback progress(fraction, message), called once after each email;
+    fraction is between 0 and 1 and covers all accounts. Never interrupted by an exception;
+    every problem is recorded in "problems".
     """
     db.init_db()
     summary = {"accounts": {}, "problems": []}
     try:
         accounts = load_accounts()
-    except (OSError, ValueError) as e:           # 文件读不了或 JSON 格式错误
-        summary["problems"].append(f"读取 {ACCOUNTS_FILE} 失败（{type(e).__name__}）：{e}")
+    except (OSError, ValueError) as e:           # File unreadable or invalid JSON
+        summary["problems"].append(f"Failed to read {ACCOUNTS_FILE} ({type(e).__name__}): {e}")
         return summary
     if not accounts:
-        summary["problems"].append(f"{ACCOUNTS_FILE} 里没有启用的账号")
+        summary["problems"].append(f"No enabled accounts in {ACCOUNTS_FILE}")
         return summary
 
-    # 先列出所有账号的新邮件 ID，算出总数，才能计算进度
+    # First list the new message IDs of every account to get the total, so progress can be computed
     jobs = []
     for account in accounts:
         service, found, new_ids, problems = prepare_account(account, days, max_per_account)
@@ -284,7 +297,7 @@ def fetch_all(days=2, max_per_account=200, progress=None):
             summary["accounts"][account["alias"]] = {"found": found, "new": 0, "failed": 0}
             jobs.append((account["alias"], service, new_ids))
 
-    # 再逐封读取，每读到一封就立刻存库
+    # Then read them one by one, saving each email as soon as it is read
     total = sum(len(new_ids) for _, _, new_ids in jobs)
     done = 0
     for alias, service, new_ids in jobs:
@@ -293,31 +306,32 @@ def fetch_all(days=2, max_per_account=200, progress=None):
             try:
                 if save_one(service, alias, msg_id):
                     stats["new"] += 1
-            except Exception:                    # 单封失败不影响其他邮件
+            except Exception:                    # One failed email does not affect the others
                 stats["failed"] += 1
             done += 1
             if progress is not None:
-                progress(done / total, f"{alias}：已处理 {done}/{total} 封")
+                progress(done / total, f"{alias}: processed {done}/{total} emails")
     return summary
 
 
-# ---------------------------------------------------------------- 命令行入口
+# ---------------------------------------------------------------- command-line entry point
 
 def format_summary(summary):
-    """把汇总字典排成几行文字，供命令行打印。"""
-    lines = [f"[{alias}] 找到 {s['found']} 封，新增 {s['new']} 封，失败 {s['failed']} 封"
+    """Format the summary dict as a few lines of text for printing on the command line."""
+    lines = [f"[{alias}] found {s['found']}, new {s['new']}, failed {s['failed']}"
              for alias, s in summary["accounts"].items()]
     if summary["problems"]:
-        lines.append("问题：")
+        lines.append("Problems:")
         lines.extend(f"  - {p}" for p in summary["problems"])
-    return "\n".join(lines) if lines else "没有处理任何账号。"
+    return "\n".join(lines) if lines else "No accounts were processed."
 
 
 def main():
-    ap = argparse.ArgumentParser(description="从多个 Gmail 账号拉取收件箱新邮件，存进 mail.db")
+    ap = argparse.ArgumentParser(description="Fetch new inbox mail from several Gmail accounts into mail.db")
     ap.add_argument("--days", type=int, default=2,
-                    help="库里没有该账号的邮件时，拉最近几天（默认 2）")
-    ap.add_argument("--max", type=int, default=200, help="每个账号单次最多处理几封（默认 200）")
+                    help="If the database has no mail for an account, how many days back to fetch (default 2)")
+    ap.add_argument("--max", type=int, default=200,
+                    help="Maximum emails to process per account in one run (default 200)")
     args = ap.parse_args()
     print(format_summary(fetch_all(days=args.days, max_per_account=args.max)))
 
