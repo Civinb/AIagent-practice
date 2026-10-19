@@ -5,25 +5,6 @@
 - 只在本机运行，界面只监听 `127.0.0.1`，同一局域网的其他设备打不开。
 - 只读 Gmail：不发送、不删除、不修改 Gmail 里的任何邮件。
 
-## 文件说明
-
-| 文件 | 作用 |
-| --- | --- |
-| `credentials.json` | Google OAuth 客户端文件（从 Google Cloud 控制台下载） |
-| `accounts.json` | 账号清单：别名、邮箱、用途说明、是否启用 |
-| `tokens/` | 各账号的授权令牌（`别名.json`），以及授权日期记录 `authorized_dates.json` |
-| `authorize.py` | 首次授权 / 重新授权，为每个账号生成令牌 |
-| `fetch_mail.py` | 拉取各账号收件箱"主要"标签页的新邮件，存进数据库 |
-| `analyze.py` | 用 Gemini 分析新邮件；也可导出 `eval.csv` 供人工评估 |
-| `prompt_v1.md` | 分析用的提示词 |
-| `db.py` | 数据库读写（所有 SQL 都在这里） |
-| `test_db.py` | `db.py` 的测试，用临时数据库，不碰 `mail.db` |
-| `app.py` | 网页界面：分拣、待办、已丢弃三个标签页 |
-| `start.bat` | 双击启动界面（Windows） |
-| `requirements.txt` | 依赖清单（固定版本） |
-| `mail.db` | SQLite 数据库：邮件、分析结果、待办（运行后自动生成） |
-| `eval.csv` | `analyze.py --export` 导出的评估表（可选） |
-
 ## 首次使用
 
 ### 0. 准备（只做一次）
@@ -70,30 +51,4 @@ python authorize.py work
 把 `work` 换成 `accounts.json` 里的每个别名，逐个运行。每个账号上次的授权时间记录在 `tokens/authorized_dates.json`。
 注意：不带别名的 `python authorize.py` 只处理"还没有令牌"的账号，已有（但过期）令牌的账号要带别名。
 
-## 备份 mail.db
 
-1. 先关闭界面（关掉 `start.bat` 窗口），确保没有程序正在写数据库。
-2. 复制 `mail.db`，文件名带上日期，例如在项目文件夹的 PowerShell 里运行：
-   ```powershell
-   Copy-Item mail.db "$HOME\Documents\mail_$(Get-Date -Format yyyy-MM-dd).db"
-   ```
-   会得到 `文档\mail_2026-10-18.db` 这样的文件。也可以在资源管理器里直接复制粘贴后改名。
-
-备份文件里有邮件正文，建议放在项目文件夹以外（如上面的"文档"），以免被误提交到 git。
-恢复时：关闭界面，用备份文件替换 `mail.db`（改回这个名字）。
-
-## .gitignore
-
-以下文件含有密钥、令牌或邮件内容，必须写在 `.gitignore` 里，不要提交：
-
-```text
-credentials.json
-accounts.json
-tokens/
-mail.db
-eval.csv
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-```
