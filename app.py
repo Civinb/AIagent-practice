@@ -4,9 +4,10 @@
     python app.py
 然后打开终端里显示的地址（只监听 127.0.0.1，不对外公开）。
 
-两个标签页：
-    分拣  拉取并分析、筛选、勾选后加入待办或丢弃、查看单封详情
-    待办  查看未完成待办（带紧急标记）、标记完成、删除、编辑标题/截止日期/备注、撤销完成
+三个标签页：
+    分拣    拉取并分析、筛选、勾选后加入待办或丢弃、查看单封详情
+    待办    查看未完成待办（带紧急标记）、标记完成、删除、编辑标题/截止日期/备注、撤销完成
+    已丢弃  查看最近丢弃的邮件，勾选后恢复到待审
 界面只读写本地数据库 mail.db，不发送、不删除、不修改 Gmail 里的任何邮件。
 """
 
@@ -36,6 +37,9 @@ SORT_CHOICES = [("按截止日期", db.SORT_DEADLINE), ("按优先级", db.SORT_
 DONE_LIMIT = 30                                    # "已完成"里最多显示最近完成的条数
 URGENT_DAYS = 3                                    # 剩 1–3 天的显示"🟡 剩 N 天"
 TITLE_MAX_CHARS = 40                               # 待办列表里标题最多显示的字数
+
+# 已丢弃页
+DISCARDED_LIMIT = 100                              # 最多显示最近丢弃的封数
 
 _MD_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|<>~])")   # Markdown 里需要转义的字符
 _DATE_FORMAT = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")  # 截止日期必须严格是 YYYY-MM-DD
@@ -604,6 +608,77 @@ def on_undo_done(selected, account, sort, edit_id):
         return todo_error_outputs(e)
 
 
+# ================================================================ 已丢弃页
+
+# ---------------------------------------------------------------- 列表显示
+
+def discard_time(email):
+    """丢弃时间的显示文字：status_changed_at（ISO 格式）→ 10/18 19:25；格式不对就原样返回。"""
+    value = email["status_changed_at"]
+    try:
+        t = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return value or "（时间未知）"
+    return f"{t.month}/{t.day} {t:%H:%M}"
+
+
+def discarded_label(email):
+    """已丢弃列表里一封邮件的显示文字：丢弃时间 + 与分拣页相同的文字。"""
+    return f"丢弃于 {discard_time(email)} | {email_label(email)}"
+
+
+def only_discarded(keys):
+    """只保留现在仍是已丢弃状态的 key（界面可能过期，防止把已处理的邮件再改一次）。"""
+    discarded = {e["key"] for e in db.list_emails(db.DISCARDED)}
+    return [k for k in keys if k in discarded]
+
+
+def discarded_status_text(message=""):
+    """已丢弃页状态文字：已丢弃总数、列表显示的数量 + 上一次操作的结果。"""
+    total = sum(c[db.DISCARDED] for c in db.count_by_status().values())
+    text = f"**已丢弃**：共 {total} 封，下面列出最近丢弃的 {min(total, DISCARDED_LIMIT)} 封"
+    return text + "\n\n" + message if message else text
+
+
+# ---------------------------------------------------------------- 刷新
+
+def refresh_discarded(message=""):
+    """重新生成已丢弃页，返回值顺序与 build_discarded_tab 里的 outputs 一致：
+
+    (已丢弃列表, 状态文字)
+    列表按丢弃时间倒序，最多 DISCARDED_LIMIT 封，勾选清空。
+    """
+    emails = db.list_emails(db.DISCARDED, limit=DISCARDED_LIMIT)
+    choices = [(discarded_label(e), e["key"]) for e in emails]
+    return gr.CheckboxGroup(choices=choices, value=[]), discarded_status_text(message)
+
+
+def discarded_error_outputs(err):
+    """出错时：只在状态文字里显示错误，列表保持不变。"""
+    return gr.skip(), f"**出错**：{md_escape(describe_error(err))}"
+
+
+# ---------------------------------------------------------------- 已丢弃页事件
+
+def on_discarded_refresh():
+    """打开页面、分拣页丢弃之后刷新。"""
+    try:
+        return refresh_discarded()
+    except Exception as e:
+        return discarded_error_outputs(e)
+
+
+def on_restore(selected):
+    """把勾选的已丢弃邮件恢复到待审。"""
+    try:
+        if not selected:
+            return gr.skip(), discarded_status_text("没有勾选任何邮件，未做任何操作。")
+        changed = db.set_status(only_discarded(selected), db.REVIEW)
+        return refresh_discarded(f"已恢复到待审 {changed} 封。")
+    except Exception as e:
+        return discarded_error_outputs(e)
+
+
 # ---------------------------------------------------------------- 界面
 
 def build_todo_tab(demo):
@@ -672,10 +747,33 @@ def build_todo_tab(demo):
     return {"fn": on_todo_refresh, "inputs": view, "outputs": outputs}
 
 
+def build_discarded_tab(demo):
+    """在当前位置搭建"已丢弃"标签页的内容并绑定事件。
+
+    返回 {"restore": "恢复到待审"按钮的事件, "refresh": 刷新本页的事件参数（fn / inputs / outputs）}，
+    供 build_app 在恢复之后刷新分拣页、在分拣页丢弃之后刷新本页。
+    """
+    status_md = gr.Markdown()
+    discarded_list = gr.CheckboxGroup(label=f"最近丢弃的 {DISCARDED_LIMIT} 封", show_label=True,
+                                      show_select_all=True)
+    restore_btn = gr.Button("恢复到待审", variant="primary")
+
+    # 刷新类事件的输出，顺序与 refresh_discarded() 的返回值一致
+    outputs = [discarded_list, status_md]
+
+    demo.load(on_discarded_refresh, inputs=None, outputs=outputs)
+    restore_event = restore_btn.click(on_restore, inputs=discarded_list, outputs=outputs)
+
+    return {"restore": restore_event,
+            "refresh": {"fn": on_discarded_refresh, "inputs": None, "outputs": outputs}}
+
+
 def build_sort_tab(demo):
     """在当前位置搭建"分拣"标签页的内容并绑定事件。
 
-    返回"加入待办"按钮的事件，供 build_app 在它之后用 .then 刷新待办页。
+    返回 {"add": "加入待办"的事件, "discards": ["丢弃选中"、"确认丢弃"的事件],
+          "refresh": 刷新本页的事件参数（fn / inputs / outputs）}，
+    供 build_app 用 .then 刷新待办页、已丢弃页，以及在已丢弃页恢复之后刷新本页。
     """
     with gr.Row():
         pull_btn = gr.Button("拉取并分析", variant="primary", scale=0, min_width=160)
@@ -710,37 +808,46 @@ def build_sort_tab(demo):
     pull_btn.click(on_pull, inputs=filters + [detail_dd], outputs=outputs)
     add_event = add_btn.click(on_add_todos, inputs=[mail_list] + filters + [detail_dd],
                               outputs=outputs)
-    discard_btn.click(on_discard_selected, inputs=[mail_list] + filters + [detail_dd],
-                      outputs=outputs)
+    discard_event = discard_btn.click(on_discard_selected,
+                                      inputs=[mail_list] + filters + [detail_dd], outputs=outputs)
 
     discard_rest_btn.click(on_ask_discard_rest, inputs=[mail_list] + filters,
                            outputs=[confirm_row, confirm_md, pending_keys, status_md])
-    confirm_btn.click(on_confirm_discard_rest, inputs=[pending_keys] + filters + [detail_dd],
-                      outputs=outputs)
+    confirm_event = confirm_btn.click(on_confirm_discard_rest,
+                                      inputs=[pending_keys] + filters + [detail_dd],
+                                      outputs=outputs)
     cancel_btn.click(on_cancel_discard_rest, inputs=None, outputs=[confirm_row, pending_keys])
 
     # 只响应用户手动选择；刷新时 refresh() 已经直接更新了详情
     detail_dd.input(on_select_detail, inputs=detail_dd, outputs=detail_md)
 
-    return add_event
+    return {"add": add_event,
+            "discards": [discard_event, confirm_event],
+            "refresh": {"fn": on_refresh, "inputs": filters + [detail_dd], "outputs": outputs}}
 
 
 def build_app():
-    """搭建整个界面：分拣、待办两个标签页。"""
+    """搭建整个界面：分拣、待办、已丢弃三个标签页。"""
     with gr.Blocks(title="邮件分拣") as demo:
         with gr.Tabs():
             with gr.Tab("分拣"):
-                add_event = build_sort_tab(demo)
+                sort_tab = build_sort_tab(demo)
             with gr.Tab("待办"):
                 refresh_todo_tab = build_todo_tab(demo)
-        # 分拣页"加入待办"完成后（无论成败）刷新待办页，切过去立即可见
-        add_event.then(**refresh_todo_tab)
+            with gr.Tab("已丢弃"):
+                discarded_tab = build_discarded_tab(demo)
+        # 以下刷新都在前一个事件完成后（无论成败）进行，切到对应标签页立即可见
+        sort_tab["add"].then(**refresh_todo_tab)               # 加入待办 → 刷新待办页
+        for event in sort_tab["discards"]:                     # 丢弃选中 / 确认丢弃 → 刷新已丢弃页
+            event.then(**discarded_tab["refresh"])
+        discarded_tab["restore"].then(**sort_tab["refresh"])   # 恢复到待审 → 刷新分拣页
     return demo
 
 
 def main():
     db.init_db()
-    build_app().launch(server_name="127.0.0.1")
+    # 只监听本机；share=False 显式写出，防止环境变量 GRADIO_SHARE=True 时生成公网链接
+    build_app().launch(server_name="127.0.0.1", share=False)
 
 
 if __name__ == "__main__":
